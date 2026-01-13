@@ -36,6 +36,15 @@ pub struct EncryptedKey {
     /// Additional properties associated with the key
     #[builder(default)]
     pub(crate) properties: HashMap<String, String>,
+    /// Version of the key (for rotation tracking)
+    #[builder(default = 1)]
+    pub(crate) version: u32,
+    /// Timestamp when the key was created (milliseconds since epoch)
+    #[builder(default, setter(strip_option))]
+    pub(crate) created_at: Option<i64>,
+    /// Timestamp when the key expires (milliseconds since epoch)
+    #[builder(default, setter(strip_option))]
+    pub(crate) expires_at: Option<i64>,
 }
 
 impl EncryptedKey {
@@ -58,6 +67,39 @@ impl EncryptedKey {
     pub fn properties(&self) -> &HashMap<String, String> {
         &self.properties
     }
+
+    /// Returns the key version
+    pub fn version(&self) -> u32 {
+        self.version
+    }
+
+    /// Returns when the key was created
+    pub fn created_at(&self) -> Option<i64> {
+        self.created_at
+    }
+
+    /// Returns when the key expires
+    pub fn expires_at(&self) -> Option<i64> {
+        self.expires_at
+    }
+
+    /// Check if the key has expired
+    pub fn is_expired(&self) -> bool {
+        if let Some(expires_at) = self.expires_at {
+            let now_millis = chrono::Utc::now().timestamp_millis();
+            now_millis > expires_at
+        } else {
+            false
+        }
+    }
+
+    /// Get the age of the key in days
+    pub fn age_days(&self) -> Option<i64> {
+        self.created_at.map(|created| {
+            let now_millis = chrono::Utc::now().timestamp_millis();
+            (now_millis - created) / (24 * 60 * 60 * 1000)
+        })
+    }
 }
 
 pub(super) mod _serde {
@@ -75,6 +117,23 @@ pub(super) mod _serde {
         pub encrypted_by_id: Option<String>,
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         pub properties: HashMap<String, String>,
+        #[serde(
+            default = "default_version",
+            skip_serializing_if = "is_default_version"
+        )]
+        pub version: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub created_at: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub expires_at: Option<i64>,
+    }
+
+    fn default_version() -> u32 {
+        1
+    }
+
+    fn is_default_version(v: &u32) -> bool {
+        *v == 1
     }
 
     impl From<&EncryptedKey> for EncryptedKeySerde {
@@ -84,6 +143,9 @@ pub(super) mod _serde {
                 encrypted_key_metadata: BASE64.encode(&key.encrypted_key_metadata),
                 encrypted_by_id: key.encrypted_by_id.clone(),
                 properties: key.properties.clone(),
+                version: key.version,
+                created_at: key.created_at,
+                expires_at: key.expires_at,
             }
         }
     }
@@ -99,6 +161,9 @@ pub(super) mod _serde {
                 encrypted_key_metadata,
                 encrypted_by_id: serde_key.encrypted_by_id,
                 properties: serde_key.properties,
+                version: serde_key.version,
+                created_at: serde_key.created_at,
+                expires_at: serde_key.expires_at,
             })
         }
     }

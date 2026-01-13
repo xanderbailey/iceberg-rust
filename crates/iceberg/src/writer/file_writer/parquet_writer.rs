@@ -36,6 +36,7 @@ use crate::arrow::{
     ArrowFileReader, DEFAULT_MAP_FIELD_NAME, FieldMatchMode, NanValueCountVisitor,
     get_parquet_stat_max_as_datum, get_parquet_stat_min_as_datum,
 };
+use crate::encryption::{EncryptedOutputFile, EncryptionConfig, EncryptionManager};
 use crate::io::{FileIO, FileWrite, OutputFile};
 use crate::spec::{
     DataContentType, DataFileBuilder, DataFileFormat, Datum, ListType, Literal, MapType,
@@ -47,11 +48,12 @@ use crate::writer::{CurrentFileStatus, DataFile};
 use crate::{Error, ErrorKind, Result};
 
 /// ParquetWriterBuilder is used to builder a [`ParquetWriter`]
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ParquetWriterBuilder {
     props: WriterProperties,
     schema: SchemaRef,
     match_mode: FieldMatchMode,
+    encryption_manager: Option<Arc<dyn EncryptionManager>>,
 }
 
 impl ParquetWriterBuilder {
@@ -71,7 +73,14 @@ impl ParquetWriterBuilder {
             props,
             schema,
             match_mode,
+            encryption_manager: None,
         }
+    }
+
+    /// Set the encryption manager for encrypting Parquet files
+    pub fn with_encryption_manager(mut self, manager: Arc<dyn EncryptionManager>) -> Self {
+        self.encryption_manager = Some(manager);
+        self
     }
 }
 
@@ -79,6 +88,10 @@ impl FileWriterBuilder for ParquetWriterBuilder {
     type R = ParquetWriter;
 
     async fn build(&self, output_file: OutputFile) -> Result<Self::R> {
+        // Handle encryption if manager is provided
+        // For now, we're not using native Parquet encryption, just tracking metadata
+        // When Parquet crate supports encryption, we would pass encryption properties here
+
         Ok(ParquetWriter {
             schema: self.schema.clone(),
             inner_writer: None,
@@ -86,6 +99,8 @@ impl FileWriterBuilder for ParquetWriterBuilder {
             current_row_num: 0,
             output_file,
             nan_value_count_visitor: NanValueCountVisitor::new_with_match_mode(self.match_mode),
+            encryption_manager: self.encryption_manager.clone(),
+            encrypted_output: None,
         })
     }
 }
@@ -216,6 +231,8 @@ pub struct ParquetWriter {
     writer_properties: WriterProperties,
     current_row_num: usize,
     nan_value_count_visitor: NanValueCountVisitor,
+    encryption_manager: Option<Arc<dyn EncryptionManager>>,
+    encrypted_output: Option<EncryptedOutputFile>,
 }
 
 /// Used to aggregate min and max value of each column.

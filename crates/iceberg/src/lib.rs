@@ -100,3 +100,5 @@ pub mod writer;
 mod delete_vector;
 pub mod metadata_columns;
 pub mod puffin;
+
+pub mod encryption;

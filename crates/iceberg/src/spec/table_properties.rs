@@ -51,6 +51,12 @@ pub struct TableProperties {
     pub write_target_file_size_bytes: usize,
     /// Whether to use `FanoutWriter` for partitioned tables.
     pub write_datafusion_fanout_enabled: bool,
+    /// Master key identifier for encryption.
+    pub encryption_master_key_id: Option<String>,
+    /// Encryption algorithm to use.
+    pub encryption_algorithm: Option<String>,
+    /// Key rotation period in days.
+    pub encryption_key_rotation_days: Option<u32>,
 }
 
 impl TableProperties {
@@ -144,6 +150,18 @@ impl TableProperties {
     pub const PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED: &str = "write.datafusion.fanout.enabled";
     /// Default value for fanout writer enabled
     pub const PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED_DEFAULT: bool = true;
+
+    /// Master key identifier for encryption
+    pub const PROPERTY_ENCRYPTION_MASTER_KEY_ID: &str = "encryption.key-id";
+
+    /// Encryption algorithm to use
+    pub const PROPERTY_ENCRYPTION_ALGORITHM: &str = "encryption.algorithm";
+
+    /// Key rotation period in days
+    pub const PROPERTY_ENCRYPTION_KEY_ROTATION_DAYS: &str = "encryption.key-rotation-days";
+
+    /// Default key rotation period (2 years per NIST recommendations)
+    pub const PROPERTY_ENCRYPTION_KEY_ROTATION_DAYS_DEFAULT: u32 = 730;
 }
 
 impl TryFrom<&HashMap<String, String>> for TableProperties {
@@ -187,6 +205,15 @@ impl TryFrom<&HashMap<String, String>> for TableProperties {
                 TableProperties::PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED,
                 TableProperties::PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED_DEFAULT,
             )?,
+            encryption_master_key_id: props
+                .get(TableProperties::PROPERTY_ENCRYPTION_MASTER_KEY_ID)
+                .cloned(),
+            encryption_algorithm: props
+                .get(TableProperties::PROPERTY_ENCRYPTION_ALGORITHM)
+                .cloned(),
+            encryption_key_rotation_days: props
+                .get(TableProperties::PROPERTY_ENCRYPTION_KEY_ROTATION_DAYS)
+                .and_then(|v| v.parse::<u32>().ok()),
         })
     }
 }

@@ -42,6 +42,9 @@ storage-s3 = ["opendal/services-s3", "reqsign"]
 
 [dependencies]
 aes-gcm = { workspace = true }
+aws-config = "1.0"
+aws-sdk-kms = "1.0"
+ring = "0.17"
 anyhow = { workspace = true }
 apache-avro = { workspace = true }
 array-init = { workspace = true }
