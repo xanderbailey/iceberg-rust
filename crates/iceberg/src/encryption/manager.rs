@@ -91,6 +91,9 @@ pub trait EncryptionManager: Send + Sync {
 
     /// Check if key rotation is needed
     async fn needs_rotation(&self) -> Result<bool>;
+
+    /// Get the raw encryption key for native format encryption
+    async fn get_raw_key(&self, key_metadata: &KeyMetadata) -> Result<Vec<u8>>;
 }
 
 /// Standard implementation of encryption manager
@@ -212,6 +215,12 @@ impl StandardEncryptionManager {
         )?))
     }
 
+    /// Get the raw encryption key for native format encryption
+    pub async fn get_raw_key(&self, key_metadata: &KeyMetadata) -> Result<Vec<u8>> {
+        // Unwrap the key using KMS
+        self.kms.unwrap_key(&key_metadata.encrypted_key).await
+    }
+
     /// Get encryptor for a specific key ID
     async fn get_encryptor_by_key_id(&self, key_id: &str) -> Result<Arc<AesGcmEncryptor>> {
         let rotation_info = self.rotation_info.read().await;
@@ -295,6 +304,11 @@ impl EncryptionManager for StandardEncryptionManager {
     async fn needs_rotation(&self) -> Result<bool> {
         let rotation_info = self.rotation_info.read().await;
         Ok(rotation_info.needs_rotation())
+    }
+
+    async fn get_raw_key(&self, key_metadata: &KeyMetadata) -> Result<Vec<u8>> {
+        // Unwrap the key using KMS
+        self.kms.unwrap_key(&key_metadata.encrypted_key).await
     }
 }
 

@@ -27,6 +27,8 @@ use itertools::Itertools;
 use parquet::arrow::AsyncArrowWriter;
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::async_writer::AsyncFileWriter as ArrowAsyncFileWriter;
+#[cfg(feature = "encryption")]
+use parquet::encryption::encrypt::FileEncryptionProperties;
 use parquet::file::metadata::ParquetMetaData;
 use parquet::file::properties::WriterProperties;
 use parquet::file::statistics::Statistics;
@@ -88,22 +90,44 @@ impl FileWriterBuilder for ParquetWriterBuilder {
     type R = ParquetWriter;
 
     async fn build(&self, output_file: OutputFile) -> Result<Self::R> {
-        // Handle encryption if manager is provided
-        // For now, we're not using native Parquet encryption, just tracking metadata
-        // When Parquet crate supports encryption, we would pass encryption properties here
+        // Create writer properties with encryption if manager is provided
+        let (writer_properties) = if let Some(ref manager) = self.encryption_manager {
+            // Get current encryption key metadata
+            let key_metadata = manager.current_key_metadata().await?;
+
+            // Get the actual encryption key for native Parquet encryption
+            let file_key = manager.get_raw_key(&key_metadata).await?;
+
+            // Create FileEncryptionProperties for native Parquet encryption
+            let encryption_props = FileEncryptionProperties::builder(file_key.into())
+                .with_aad_prefix(key_metadata.aad_prefix.clone().into())
+                // Store AAD in file so readers don't need to provide it
+                .with_aad_prefix_storage(true)
+                .build()
+                .map_err(|e| Error::new(ErrorKind::Unexpected, "Failed to create encryption properties").with_source(e))?;
+
+            // Create new writer properties with encryption
+            let props = self.props.clone().into_builder()
+                .with_file_encryption_properties(encryption_props)
+                .build();
+
+            props
+        } else {
+            self.props.clone()
+        };
 
         Ok(ParquetWriter {
             schema: self.schema.clone(),
             inner_writer: None,
-            writer_properties: self.props.clone(),
+            writer_properties,
             current_row_num: 0,
             output_file,
             nan_value_count_visitor: NanValueCountVisitor::new_with_match_mode(self.match_mode),
             encryption_manager: self.encryption_manager.clone(),
-            encrypted_output: None,
         })
     }
 }
+
 
 /// A mapping from Parquet column path names to internal field id
 struct IndexByParquetPathName {
@@ -232,7 +256,6 @@ pub struct ParquetWriter {
     current_row_num: usize,
     nan_value_count_visitor: NanValueCountVisitor,
     encryption_manager: Option<Arc<dyn EncryptionManager>>,
-    encrypted_output: Option<EncryptedOutputFile>,
 }
 
 /// Used to aggregate min and max value of each column.

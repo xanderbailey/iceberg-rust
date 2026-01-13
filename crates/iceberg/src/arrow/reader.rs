@@ -45,9 +45,12 @@ use parquet::file::metadata::{
 use parquet::schema::types::{SchemaDescriptor, Type as ParquetType};
 
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
+use crate::arrow::encrypted_reader::EncryptedArrowFileReader;
 use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
 use crate::arrow::{arrow_schema_to_schema, get_arrow_datum};
 use crate::delete_vector::DeleteVector;
+#[cfg(feature = "encryption")]
+use crate::encryption::EncryptionManager;
 use crate::error::Result;
 use crate::expr::visitors::bound_predicate_visitor::{BoundPredicateVisitor, visit};
 use crate::expr::visitors::page_index_evaluator::PageIndexEvaluator;
@@ -484,6 +487,39 @@ impl ArrowReader {
             .with_preload_column_index(true)
             .with_preload_offset_index(true)
             .with_preload_page_index(should_load_page_index);
+
+        // Create the record batch stream builder, which wraps the parquet file reader
+        let options = arrow_reader_options.unwrap_or_default();
+        let record_batch_stream_builder =
+            ParquetRecordBatchStreamBuilder::new_with_options(parquet_file_reader, options).await?;
+        Ok(record_batch_stream_builder)
+    }
+
+    /// Create a parquet record batch stream builder with encryption support
+    #[cfg(feature = "encryption")]
+    pub(crate) async fn create_encrypted_parquet_record_batch_stream_builder(
+        data_file_path: &str,
+        file_io: FileIO,
+        should_load_page_index: bool,
+        arrow_reader_options: Option<ArrowReaderOptions>,
+        encryption_manager: Arc<dyn EncryptionManager>,
+    ) -> Result<ParquetRecordBatchStreamBuilder<EncryptedArrowFileReader<impl FileRead + Sized>>> {
+        // Get the metadata for the Parquet file we need to read and build
+        // a reader for the data within
+        let parquet_file = file_io.new_input(data_file_path)?;
+        let (parquet_metadata, parquet_reader) =
+            try_join!(parquet_file.metadata(), parquet_file.reader())?;
+
+        // Create encrypted reader
+        let parquet_file_reader = EncryptedArrowFileReader::new_with_encryption(
+            parquet_metadata,
+            parquet_reader,
+            encryption_manager,
+        )
+        .await?
+        .with_preload_column_index(true)
+        .with_preload_offset_index(true)
+        .with_preload_page_index(should_load_page_index);
 
         // Create the record batch stream builder, which wraps the parquet file reader
         let options = arrow_reader_options.unwrap_or_default();

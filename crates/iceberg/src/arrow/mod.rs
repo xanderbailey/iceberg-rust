@@ -26,8 +26,11 @@ pub(crate) mod caching_delete_file_loader;
 /// Delete File loader
 pub mod delete_file_loader;
 pub(crate) mod delete_filter;
+/// Encrypted reader support
+pub mod encrypted_reader;
 
 mod reader;
+pub use reader::ArrowFileReader;
 /// RecordBatch projection utilities
 pub mod record_batch_projector;
 pub(crate) mod record_batch_transformer;

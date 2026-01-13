@@ -29,8 +29,9 @@ license = { workspace = true }
 repository = { workspace = true }
 
 [features]
-default = ["storage-memory", "storage-fs", "storage-s3"]
+default = ["storage-memory", "storage-fs", "storage-s3", "encryption"]
 storage-all = ["storage-memory", "storage-fs", "storage-s3", "storage-gcs"]
+encryption = ["parquet/encryption"]
 
 storage-azdls = ["opendal/services-azdls"]
 storage-fs = ["opendal/services-fs"]
