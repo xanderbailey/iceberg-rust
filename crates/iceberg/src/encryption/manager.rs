@@ -21,8 +21,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bytes::Bytes;
-use chrono::Utc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -31,7 +29,6 @@ use crate::encryption::{
     KeyManagementClient, KeyMetadata, KeyRotationInfo, SecureKey,
 };
 use crate::io::{InputFile, OutputFile};
-use crate::spec::EncryptedKey;
 use crate::{Error, ErrorKind, Result};
 
 /// Configuration for encryption operations
@@ -111,8 +108,8 @@ pub struct StandardEncryptionManager {
     /// Key rotation information
     rotation_info: Arc<RwLock<KeyRotationInfo>>,
 
-    /// Table identifier
-    table_id: String,
+    /// Table identifier (kept for future use)
+    _table_id: String,
 }
 
 impl StandardEncryptionManager {
@@ -130,7 +127,7 @@ impl StandardEncryptionManager {
             config,
             cache: KeyCache::new(),
             rotation_info: Arc::new(RwLock::new(KeyRotationInfo::new(initial_key))),
-            table_id,
+            _table_id: table_id,
         })
     }
 
@@ -146,7 +143,7 @@ impl StandardEncryptionManager {
             config,
             cache: KeyCache::new(),
             rotation_info: Arc::new(RwLock::new(rotation_info)),
-            table_id,
+            _table_id: table_id,
         }
     }
 
@@ -157,7 +154,7 @@ impl StandardEncryptionManager {
         table_id: &str,
     ) -> Result<KeyMetadata> {
         // Generate data encryption key
-        let (plaintext_key, encrypted_key) = kms
+        let (_plaintext_key, encrypted_key) = kms
             .generate_data_key(&config.master_key_id, config.algorithm.key_length())
             .await?;
 
@@ -222,6 +219,7 @@ impl StandardEncryptionManager {
     }
 
     /// Get encryptor for a specific key ID
+    #[allow(dead_code)]
     async fn get_encryptor_by_key_id(&self, key_id: &str) -> Result<Arc<AesGcmEncryptor>> {
         let rotation_info = self.rotation_info.read().await;
 
@@ -273,7 +271,7 @@ impl EncryptionManager for StandardEncryptionManager {
         }
 
         // Generate new key
-        let (plaintext_key, encrypted_key) = self
+        let (_plaintext_key, encrypted_key) = self
             .kms
             .generate_data_key(
                 &self.config.master_key_id,

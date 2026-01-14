@@ -497,6 +497,7 @@ impl ArrowReader {
 
     /// Create a parquet record batch stream builder with encryption support
     #[cfg(feature = "encryption")]
+    #[allow(dead_code)]
     pub(crate) async fn create_encrypted_parquet_record_batch_stream_builder(
         data_file_path: &str,
         file_io: FileIO,

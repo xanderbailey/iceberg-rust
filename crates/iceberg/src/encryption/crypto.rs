@@ -77,7 +77,7 @@ use std::fmt;
 use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng};
 use aes_gcm::{Aes128Gcm, Aes256Gcm, Key, Nonce};
 use bytes::{Bytes, BytesMut};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::ZeroizeOnDrop;
 
 use crate::{Error, ErrorKind, Result};
 

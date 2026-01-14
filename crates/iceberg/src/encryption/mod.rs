@@ -35,8 +35,6 @@ pub mod parquet;
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use bytes::Bytes;
 pub use cache::KeyCache;
 pub use crypto::{AesGcmEncryptor, EncryptionAlgorithm, SecureKey};
 pub use key_management::KeyManagementClient;
@@ -45,7 +43,6 @@ pub use manager::{EncryptionConfig, EncryptionManager, StandardEncryptionManager
 pub use parquet::{NativeEncryptionInputFile, NativeEncryptionOutputFile};
 
 use crate::io::{InputFile, OutputFile};
-use crate::{Error, ErrorKind, Result};
 
 /// Represents an encrypted output file
 #[derive(Debug)]

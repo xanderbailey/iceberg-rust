@@ -17,13 +17,8 @@
 
 //! Native Parquet encryption support
 
-use std::sync::Arc;
-
-use bytes::Bytes;
-
-use crate::encryption::{AesGcmEncryptor, KeyMetadata};
+use crate::encryption::KeyMetadata;
 use crate::io::{InputFile, OutputFile};
-use crate::{Error, ErrorKind, Result};
 
 /// Native encryption output file for Parquet
 ///
@@ -376,14 +371,14 @@ mod tests {
             .encrypted_key_metadata(vec![1, 2, 3])
             .build();
 
-        let key_metadata = KeyMetadata::new(
+        let _key_metadata = KeyMetadata::new(
             "key-1".to_string(),
             encrypted_key,
             "AES-256-GCM".to_string(),
             vec![0; 16],
         );
 
-        let file_key = vec![1; 32];
+        let _file_key = vec![1; 32];
 
         // let native_file =
         //     NativeEncryptionOutputFile::new(output_file, key_metadata, file_key.clone());

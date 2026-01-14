@@ -20,10 +20,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bytes::Bytes;
 
 use crate::spec::EncryptedKey;
-use crate::{Error, ErrorKind, Result};
+use crate::Result;
 
 /// Trait for key management system clients
 ///

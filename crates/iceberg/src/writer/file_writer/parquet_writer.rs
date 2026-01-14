@@ -129,7 +129,7 @@ impl FileWriterBuilder for ParquetWriterBuilder {
             current_row_num: 0,
             output_file,
             nan_value_count_visitor: NanValueCountVisitor::new_with_match_mode(self.match_mode),
-            encryption_manager: self.encryption_manager.clone(),
+            _encryption_manager: self.encryption_manager.clone(),
         })
     }
 }
@@ -261,7 +261,7 @@ pub struct ParquetWriter {
     writer_properties: WriterProperties,
     current_row_num: usize,
     nan_value_count_visitor: NanValueCountVisitor,
-    encryption_manager: Option<Arc<dyn EncryptionManager>>,
+    _encryption_manager: Option<Arc<dyn EncryptionManager>>,
 }
 
 /// Used to aggregate min and max value of each column.

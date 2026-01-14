@@ -24,7 +24,7 @@ use chrono::{DateTime, Duration, Utc};
 use tokio::sync::RwLock;
 
 use crate::encryption::crypto::SecureKey;
-use crate::{Error, ErrorKind, Result};
+use crate::Result;
 
 /// Entry in the key cache
 #[derive(Clone, Debug)]

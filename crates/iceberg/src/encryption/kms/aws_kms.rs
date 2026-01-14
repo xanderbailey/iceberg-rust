@@ -23,8 +23,6 @@ use async_trait::async_trait;
 use aws_sdk_kms::primitives::Blob;
 use aws_sdk_kms::types::{DataKeySpec, EncryptionAlgorithmSpec};
 use aws_sdk_kms::{Client, Config};
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::Utc;
 use uuid::Uuid;
 
@@ -50,7 +48,7 @@ impl AwsKmsClient {
 
     /// Create a new AWS KMS client from the default configuration
     pub async fn from_env() -> Result<Self> {
-        let config = aws_config::load_from_env().await;
+        let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         let kms_config = aws_sdk_kms::config::Builder::from(&config).build();
         Ok(Self::new(kms_config))
     }
