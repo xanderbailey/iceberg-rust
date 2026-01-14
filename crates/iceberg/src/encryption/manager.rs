@@ -76,7 +76,7 @@ impl EncryptionConfig {
 
 /// Trait for encryption managers
 #[async_trait]
-pub trait EncryptionManager: Send + Sync {
+pub trait EncryptionManager: Send + Sync + std::fmt::Debug {
     /// Encrypt a data file
     async fn encrypt_data_file(&self, plain_output: OutputFile) -> Result<EncryptedOutputFile>;
 
@@ -97,7 +97,7 @@ pub trait EncryptionManager: Send + Sync {
 }
 
 /// Standard implementation of encryption manager
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct StandardEncryptionManager {
     /// Key management client
     kms: Arc<dyn KeyManagementClient>,

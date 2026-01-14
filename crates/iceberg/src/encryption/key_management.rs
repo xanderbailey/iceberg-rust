@@ -30,7 +30,7 @@ use crate::{Error, ErrorKind, Result};
 /// This trait defines the interface for interacting with key management systems
 /// like AWS KMS, Azure Key Vault, or custom implementations.
 #[async_trait]
-pub trait KeyManagementClient: Send + Sync {
+pub trait KeyManagementClient: Send + Sync + std::fmt::Debug {
     /// Wrap (encrypt) a data encryption key using a master key
     ///
     /// # Arguments

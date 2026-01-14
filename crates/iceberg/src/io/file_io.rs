@@ -25,6 +25,8 @@ use url::Url;
 
 use super::storage::{OpenDalStorage, Storage};
 use crate::{Error, ErrorKind, Result};
+#[cfg(feature = "encryption")]
+use crate::encryption::EncryptionManager;
 
 /// FileIO implementation, used to manipulate files in underlying storage.
 ///
@@ -47,7 +49,10 @@ use crate::{Error, ErrorKind, Result};
 pub struct FileIO {
     builder: FileIOBuilder,
 
-    inner: Arc<OpenDalStorage>,
+    inner: Arc<Storage>,
+
+    #[cfg(feature = "encryption")]
+    encryption_manager: Option<Arc<dyn EncryptionManager>>,
 }
 
 impl FileIO {
@@ -131,6 +136,19 @@ impl FileIO {
     /// * path: It should be *absolute* path starting with scheme string used to construct [`FileIO`].
     pub fn new_output(&self, path: impl AsRef<str>) -> Result<OutputFile> {
         self.inner.new_output(path.as_ref())
+    }
+
+    /// Set the encryption manager for this FileIO
+    #[cfg(feature = "encryption")]
+    pub fn with_encryption_manager(mut self, manager: Arc<dyn EncryptionManager>) -> Self {
+        self.encryption_manager = Some(manager);
+        self
+    }
+
+    /// Get the encryption manager if configured
+    #[cfg(feature = "encryption")]
+    pub fn encryption_manager(&self) -> Option<Arc<dyn EncryptionManager>> {
+        self.encryption_manager.clone()
     }
 }
 
@@ -243,6 +261,8 @@ impl FileIOBuilder {
         Ok(FileIO {
             builder: self,
             inner: Arc::new(storage),
+            #[cfg(feature = "encryption")]
+            encryption_manager: None,
         })
     }
 }

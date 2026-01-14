@@ -15,20 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-<<<<<<< HEAD
-//! Encryption module for Apache Iceberg.
-//!
-//! This module provides core cryptographic primitives for encrypting
-//! and decrypting data in Iceberg tables.
-
-mod crypto;
-
-pub use crypto::{AesGcmEncryptor, EncryptionAlgorithm, SecureKey};
-=======
 //! Encryption support for Iceberg tables
 //!
 //! This module provides encryption and decryption capabilities for Iceberg data files,
 //! including support for various key management systems and encryption algorithms.
+
+
+mod crypto;
+
+pub use crypto::{AesGcmEncryptor, EncryptionAlgorithm, SecureKey};
 
 pub mod cache;
 pub mod crypto;
@@ -148,4 +143,10 @@ pub mod properties {
     pub const DEFAULT_KEY_ROTATION_DAYS: u32 = 730;
 }
 
+<<<<<<< HEAD
 >>>>>>> b92118e5 (Implement KMS for encryption / decryption)
+=======
+#[cfg(test)]
+mod integration_tests;
+
+>>>>>>> 06c49ee3 (wire)

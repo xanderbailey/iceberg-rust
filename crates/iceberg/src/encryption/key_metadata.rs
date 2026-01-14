@@ -227,7 +227,8 @@ mod tests {
         assert!(!metadata.is_expired());
 
         // Set expiration to past
-        metadata.expires_at = Some(Utc::now() - chrono::Duration::days(1));
+        let past_time = Utc::now() - chrono::Duration::days(1);
+        metadata.expires_at_ms = Some(past_time.timestamp_millis());
         assert!(metadata.is_expired());
     }
 

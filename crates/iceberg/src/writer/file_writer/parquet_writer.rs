@@ -38,7 +38,7 @@ use crate::arrow::{
     ArrowFileReader, DEFAULT_MAP_FIELD_NAME, FieldMatchMode, NanValueCountVisitor,
     get_parquet_stat_max_as_datum, get_parquet_stat_min_as_datum,
 };
-use crate::encryption::{EncryptedOutputFile, EncryptionConfig, EncryptionManager};
+use crate::encryption::EncryptionManager;
 use crate::io::{FileIO, FileWrite, OutputFile};
 use crate::spec::{
     DataContentType, DataFileBuilder, DataFileFormat, Datum, ListType, Literal, MapType,
@@ -89,9 +89,15 @@ impl ParquetWriterBuilder {
 impl FileWriterBuilder for ParquetWriterBuilder {
     type R = ParquetWriter;
 
+    #[cfg(feature = "encryption")]
+    fn with_encryption_manager(mut self, manager: Arc<dyn EncryptionManager>) -> Self {
+        self.encryption_manager = Some(manager);
+        self
+    }
+
     async fn build(&self, output_file: OutputFile) -> Result<Self::R> {
         // Create writer properties with encryption if manager is provided
-        let (writer_properties) = if let Some(ref manager) = self.encryption_manager {
+        let writer_properties = if let Some(ref manager) = self.encryption_manager {
             // Get current encryption key metadata
             let key_metadata = manager.current_key_metadata().await?;
 

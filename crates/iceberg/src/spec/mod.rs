@@ -30,7 +30,8 @@ mod sort;
 mod statistic_file;
 mod table_metadata;
 mod table_metadata_builder;
-mod table_properties;
+/// Table properties module for Iceberg tables
+pub mod table_properties;
 mod transform;
 mod values;
 mod view_metadata;

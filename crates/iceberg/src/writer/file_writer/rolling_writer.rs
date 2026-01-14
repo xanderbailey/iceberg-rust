@@ -104,15 +104,35 @@ where
 
     /// Build a new [`RollingFileWriter`].
     pub fn build(&self) -> RollingFileWriter<B, L, F> {
+        // Check if FileIO has an encryption manager and apply it to the inner builder
+        let inner_builder = self.apply_encryption_if_available(self.inner_builder.clone());
+
         RollingFileWriter {
             inner: None,
-            inner_builder: self.inner_builder.clone(),
+            inner_builder,
             target_file_size: self.target_file_size,
             data_file_builders: vec![],
             file_io: self.file_io.clone(),
             location_generator: self.location_generator.clone(),
             file_name_generator: self.file_name_generator.clone(),
         }
+    }
+
+    /// Apply encryption manager to the inner builder if available
+    #[cfg(feature = "encryption")]
+    fn apply_encryption_if_available(&self, builder: B) -> B {
+        // Check if FileIO has an encryption manager and apply it to the builder
+        if let Some(encryption_manager) = self.file_io.encryption_manager() {
+            builder.with_encryption_manager(encryption_manager)
+        } else {
+            builder
+        }
+    }
+
+    /// Apply encryption manager to the inner builder if available (no-op when encryption is disabled)
+    #[cfg(not(feature = "encryption"))]
+    fn apply_encryption_if_available(&self, builder: B) -> B {
+        builder
     }
 }
 

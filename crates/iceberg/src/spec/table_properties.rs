@@ -53,10 +53,14 @@ pub struct TableProperties {
     pub write_datafusion_fanout_enabled: bool,
     /// Master key identifier for encryption.
     pub encryption_master_key_id: Option<String>,
+    /// Data encryption key length in bytes (16, 24, or 32).
+    pub encryption_dek_length: Option<usize>,
     /// Encryption algorithm to use.
     pub encryption_algorithm: Option<String>,
     /// Key rotation period in days.
     pub encryption_key_rotation_days: Option<u32>,
+    /// KMS type for encryption (aws, in-memory, etc.).
+    pub encryption_kms_type: Option<String>,
 }
 
 impl TableProperties {
@@ -154,6 +158,12 @@ impl TableProperties {
     /// Master key identifier for encryption
     pub const PROPERTY_ENCRYPTION_MASTER_KEY_ID: &str = "encryption.key-id";
 
+    /// Data encryption key length in bytes
+    pub const PROPERTY_ENCRYPTION_DEK_LENGTH: &str = "encryption.data-key-length";
+
+    /// Default data encryption key length (16 bytes = AES-128)
+    pub const PROPERTY_ENCRYPTION_DEK_LENGTH_DEFAULT: usize = 16;
+
     /// Encryption algorithm to use
     pub const PROPERTY_ENCRYPTION_ALGORITHM: &str = "encryption.algorithm";
 
@@ -162,6 +172,12 @@ impl TableProperties {
 
     /// Default key rotation period (2 years per NIST recommendations)
     pub const PROPERTY_ENCRYPTION_KEY_ROTATION_DAYS_DEFAULT: u32 = 730;
+
+    /// KMS type for encryption
+    pub const PROPERTY_ENCRYPTION_KMS_TYPE: &str = "encryption.kms.type";
+
+    /// Default KMS type
+    pub const PROPERTY_ENCRYPTION_KMS_TYPE_DEFAULT: &str = "aws";
 }
 
 impl TryFrom<&HashMap<String, String>> for TableProperties {
@@ -208,12 +224,18 @@ impl TryFrom<&HashMap<String, String>> for TableProperties {
             encryption_master_key_id: props
                 .get(TableProperties::PROPERTY_ENCRYPTION_MASTER_KEY_ID)
                 .cloned(),
+            encryption_dek_length: props
+                .get(TableProperties::PROPERTY_ENCRYPTION_DEK_LENGTH)
+                .and_then(|v| v.parse::<usize>().ok()),
             encryption_algorithm: props
                 .get(TableProperties::PROPERTY_ENCRYPTION_ALGORITHM)
                 .cloned(),
             encryption_key_rotation_days: props
                 .get(TableProperties::PROPERTY_ENCRYPTION_KEY_ROTATION_DAYS)
                 .and_then(|v| v.parse::<u32>().ok()),
+            encryption_kms_type: props
+                .get(TableProperties::PROPERTY_ENCRYPTION_KMS_TYPE)
+                .cloned(),
         })
     }
 }

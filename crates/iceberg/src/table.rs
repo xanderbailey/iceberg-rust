@@ -26,6 +26,16 @@ use crate::io::object_cache::ObjectCache;
 use crate::scan::TableScanBuilder;
 use crate::spec::{SchemaRef, TableMetadata, TableMetadataRef};
 use crate::{Error, ErrorKind, Result, TableIdent};
+#[cfg(feature = "encryption")]
+use crate::encryption::{EncryptionConfig, EncryptionManager, StandardEncryptionManager};
+#[cfg(feature = "encryption")]
+use crate::encryption::kms::{AwsKmsClient, InMemoryKms};
+#[cfg(feature = "encryption")]
+use crate::encryption::key_management::KeyManagementClient;
+#[cfg(feature = "encryption")]
+use crate::encryption::EncryptionAlgorithm;
+#[cfg(feature = "encryption")]
+use crate::spec::table_properties::TableProperties;
 
 /// Builder to create table scan.
 pub struct TableBuilder {
@@ -146,6 +156,8 @@ impl TableBuilder {
             identifier,
             readonly,
             object_cache,
+            #[cfg(feature = "encryption")]
+            encryption_manager: None, // Will be initialized after construction
         })
     }
 }
@@ -159,6 +171,8 @@ pub struct Table {
     identifier: TableIdent,
     readonly: bool,
     object_cache: Arc<ObjectCache>,
+    #[cfg(feature = "encryption")]
+    encryption_manager: Option<Arc<dyn EncryptionManager>>,
 }
 
 impl Table {
@@ -243,6 +257,86 @@ impl Table {
     /// Create a reader for the table.
     pub fn reader_builder(&self) -> ArrowReaderBuilder {
         ArrowReaderBuilder::new(self.file_io.clone())
+    }
+
+    /// Get the encryption manager if configured
+    #[cfg(feature = "encryption")]
+    pub fn encryption_manager(&self) -> Option<Arc<dyn EncryptionManager>> {
+        self.encryption_manager.clone()
+    }
+
+    /// Initialize encryption manager from table properties and update FileIO
+    #[cfg(feature = "encryption")]
+    pub async fn init_encryption(&mut self) -> Result<()> {
+        // Parse table properties
+        let properties = TableProperties::try_from(&self.metadata.properties)
+            .map_err(|e| Error::new(
+                ErrorKind::DataInvalid,
+                format!("Failed to parse table properties: {}", e),
+            ))?;
+
+        // Check if encryption is configured
+        if let Some(ref master_key_id) = properties.encryption_master_key_id {
+            // Create KMS client based on configuration
+            let kms_client = self.create_kms_client(&properties).await?;
+
+            // Determine encryption algorithm from DEK length
+            let dek_length = properties.encryption_dek_length
+                .unwrap_or(TableProperties::PROPERTY_ENCRYPTION_DEK_LENGTH_DEFAULT);
+
+            let algorithm = match dek_length {
+                16 => EncryptionAlgorithm::Aes128Gcm,
+                32 => EncryptionAlgorithm::Aes256Gcm,
+                _ => return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Invalid data encryption key length: {} (must be 16 or 32)", dek_length),
+                )),
+            };
+
+            // Create encryption config
+            let mut config = EncryptionConfig::new(master_key_id.clone(), algorithm);
+
+            // Set key rotation period if specified
+            if let Some(rotation_days) = properties.encryption_key_rotation_days {
+                config = config.with_key_rotation_days(rotation_days);
+            }
+
+            // Create encryption manager
+            let manager = StandardEncryptionManager::new(
+                kms_client,
+                config,
+                self.identifier.to_string(),
+            ).await?;
+
+            let manager = Arc::new(manager);
+            self.encryption_manager = Some(manager.clone());
+
+            // Update FileIO with encryption manager
+            self.file_io = self.file_io.clone().with_encryption_manager(manager);
+        }
+
+        Ok(())
+    }
+
+    /// Create KMS client based on table properties
+    #[cfg(feature = "encryption")]
+    async fn create_kms_client(&self, properties: &TableProperties) -> Result<Arc<dyn KeyManagementClient>> {
+        let kms_type = properties.encryption_kms_type.as_deref()
+            .unwrap_or(TableProperties::PROPERTY_ENCRYPTION_KMS_TYPE_DEFAULT);
+
+        match kms_type {
+            "aws" => {
+                let client = AwsKmsClient::from_env().await?;
+                Ok(Arc::new(client))
+            }
+            "in-memory" => {
+                Ok(Arc::new(InMemoryKms::new()))
+            }
+            _ => Err(Error::new(
+                ErrorKind::Unexpected,
+                format!("Unsupported KMS type: {}", kms_type),
+            ))
+        }
     }
 }
 

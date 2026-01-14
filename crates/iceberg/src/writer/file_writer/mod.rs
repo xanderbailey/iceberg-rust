@@ -17,6 +17,8 @@
 
 //! This module contains the writer for data file format supported by iceberg: parquet, orc.
 
+use std::sync::Arc;
+
 use arrow_array::RecordBatch;
 use futures::Future;
 
@@ -41,6 +43,14 @@ pub trait FileWriterBuilder<O = DefaultOutput>: Clone + Send + Sync + 'static {
     type R: FileWriter<O>;
     /// Build file writer.
     fn build(&self, output_file: OutputFile) -> impl Future<Output = Result<Self::R>> + Send;
+
+    /// Set the encryption manager if this builder supports encryption
+    #[cfg(feature = "encryption")]
+    fn with_encryption_manager(self, _manager: Arc<dyn crate::encryption::EncryptionManager>) -> Self {
+        // Default implementation returns self unchanged
+        // Builders that support encryption can override this
+        self
+    }
 }
 
 /// File writer focus on writing record batch to different physical file format.(Such as parquet. orc)
