@@ -15,20 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Encryption module for Apache Iceberg.
+//! Key Management System implementations.
 //!
-//! This module provides core cryptographic primitives for encrypting
-//! and decrypting data in Iceberg tables.
-//!
-//! # Key Components
-//!
-//! - [`AesGcmEncryptor`]: Low-level AES-GCM encryption/decryption
-//! - [`KeyManagementClient`]: Trait for key management system integration
-//! - [`InMemoryKms`](kms::InMemoryKms): In-memory KMS for testing
+//! This module provides implementations of the [`KeyManagementClient`] trait
+//! for different key management systems.
 
-mod crypto;
-mod key_management;
-pub mod kms;
+mod in_memory;
 
-pub use crypto::{AesGcmEncryptor, EncryptionAlgorithm, SecureKey};
-pub use key_management::KeyManagementClient;
+pub use in_memory::InMemoryKms;
