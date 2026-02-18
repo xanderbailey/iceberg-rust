@@ -20,6 +20,10 @@
 //! This module provides implementations of the [`KeyManagementClient`] trait
 //! for different key management systems.
 
+#[cfg(feature = "kms-aws")]
+mod aws;
 mod in_memory;
 
+#[cfg(feature = "kms-aws")]
+pub use aws::{AwsKms, create_aws_kms};
 pub use in_memory::InMemoryKms;
