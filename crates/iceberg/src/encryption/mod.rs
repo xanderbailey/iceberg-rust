@@ -25,9 +25,11 @@ mod file_decryptor;
 mod file_encryptor;
 pub mod kms;
 mod stream;
+pub(crate) mod key_metadata;
 
 pub use crypto::{AesGcmCipher, AesKeySize, SecureKey, SensitiveBytes};
 pub use file_decryptor::AesGcmFileDecryptor;
 pub use file_encryptor::AesGcmFileEncryptor;
 pub use kms::{GeneratedKey, KeyManagementClient};
+pub use key_metadata::StandardKeyMetadata;
 pub use stream::{AesGcmFileRead, AesGcmFileWrite};
