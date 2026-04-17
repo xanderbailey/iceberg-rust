@@ -65,7 +65,12 @@ fn split_by_offsets(
     let mut group_size: u64 = 0;
 
     for i in 1..boundaries.len() {
-        let segment_size = boundaries[i] - (if i > 0 { boundaries[i - 1] } else { group_start });
+        let segment_size = boundaries[i]
+            - (if i > 0 {
+                boundaries[i - 1]
+            } else {
+                group_start
+            });
         group_size += segment_size;
 
         if group_size >= target_split_size {
@@ -139,7 +144,11 @@ pub(crate) fn merge_adjacent_tasks(mut tasks: Vec<FileScanTask>) -> Vec<FileScan
     }
 
     // Sort by file path then by start offset for deterministic merging
-    tasks.sort_by(|a, b| a.data_file_path.cmp(&b.data_file_path).then(a.start.cmp(&b.start)));
+    tasks.sort_by(|a, b| {
+        a.data_file_path
+            .cmp(&b.data_file_path)
+            .then(a.start.cmp(&b.start))
+    });
 
     let mut result: Vec<FileScanTask> = Vec::with_capacity(tasks.len());
     let mut iter = tasks.into_iter();
@@ -194,11 +203,7 @@ mod tests {
         }
     }
 
-    fn make_parquet_task_with_offsets(
-        start: u64,
-        length: u64,
-        offsets: Vec<i64>,
-    ) -> FileScanTask {
+    fn make_parquet_task_with_offsets(start: u64, length: u64, offsets: Vec<i64>) -> FileScanTask {
         let mut task = make_task(start, length, DataFileFormat::Parquet);
         task.split_offsets = Some(offsets);
         task

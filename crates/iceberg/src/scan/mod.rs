@@ -404,8 +404,7 @@ impl TableScan {
     /// Use this method when you need evenly-sized work units, e.g. for
     /// distributing scan work across multiple threads or nodes.
     pub async fn plan_tasks(&self) -> Result<CombinedScanTaskStream> {
-        let file_tasks: Vec<FileScanTask> =
-            self.plan_files().await?.try_collect().await?;
+        let file_tasks: Vec<FileScanTask> = self.plan_files().await?.try_collect().await?;
 
         let split_tasks: Vec<FileScanTask> = file_tasks
             .into_iter()
@@ -414,8 +413,12 @@ impl TableScan {
 
         let open_file_cost = self.split_open_file_cost;
         let weight_fn = |task: &FileScanTask| -> u64 {
-            let content_size =
-                task.length + task.deletes.iter().map(|d| d.file_size_in_bytes).sum::<u64>();
+            let content_size = task.length
+                + task
+                    .deletes
+                    .iter()
+                    .map(|d| d.file_size_in_bytes)
+                    .sum::<u64>();
             let open_cost = (1 + task.deletes.len() as u64) * open_file_cost;
             content_size.max(open_cost)
         };
@@ -432,7 +435,9 @@ impl TableScan {
             .map(|group| CombinedScanTask::new(merge_adjacent_tasks(group)))
             .collect();
 
-        Ok(Box::pin(futures::stream::iter(combined.into_iter().map(Ok))))
+        Ok(Box::pin(futures::stream::iter(
+            combined.into_iter().map(Ok),
+        )))
     }
 
     /// Returns a stream of [`FileScanTask`]s.

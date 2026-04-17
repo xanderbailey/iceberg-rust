@@ -428,7 +428,7 @@ pub(crate) mod tests {
                 partition_spec: None,
                 name_mapping: None,
                 case_sensitive: false,
-            split_offsets: None,
+                split_offsets: None,
             },
             FileScanTask {
                 file_size_in_bytes: 0,
@@ -445,7 +445,7 @@ pub(crate) mod tests {
                 partition_spec: None,
                 name_mapping: None,
                 case_sensitive: false,
-            split_offsets: None,
+                split_offsets: None,
             },
         ];
 
@@ -503,7 +503,7 @@ pub(crate) mod tests {
             partition_spec: None,
             name_mapping: None,
             case_sensitive: true,
-        split_offsets: None,
+            split_offsets: None,
         };
 
         let filter = DeleteFilter::default();
