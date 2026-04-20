@@ -23,7 +23,10 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use arrow_arith::boolean::{and, and_kleene, is_not_null, is_null, not, or, or_kleene};
-use arrow_array::{Array, ArrayRef, BooleanArray, Datum as ArrowDatum, RecordBatch, Scalar};
+use arrow_array::{
+    Array, ArrayRef, BooleanArray, Datum as ArrowDatum, Float32Array, Float64Array, RecordBatch,
+    Scalar,
+};
 use arrow_cast::cast::cast;
 use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
 use arrow_schema::{
@@ -1509,6 +1512,26 @@ fn project_column(
     }
 }
 
+fn compute_is_nan(array: &ArrayRef) -> std::result::Result<BooleanArray, ArrowError> {
+    match array.data_type() {
+        DataType::Float32 => {
+            let float_array = array
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| ArrowError::CastError("Expected Float32Array".to_string()))?;
+            Ok(BooleanArray::from_unary(float_array, |v| v.is_nan()))
+        }
+        DataType::Float64 => {
+            let float_array = array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| ArrowError::CastError("Expected Float64Array".to_string()))?;
+            Ok(BooleanArray::from_unary(float_array, |v| v.is_nan()))
+        }
+        _ => Ok(BooleanArray::from(vec![false; array.len()])),
+    }
+}
+
 type PredicateResult =
     dyn FnMut(RecordBatch) -> std::result::Result<BooleanArray, ArrowError> + Send + 'static;
 
@@ -1591,8 +1614,11 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
         reference: &BoundReference,
         _predicate: &BoundPredicate,
     ) -> Result<Box<PredicateResult>> {
-        if self.bound_reference(reference)?.is_some() {
-            self.build_always_true()
+        if let Some(idx) = self.bound_reference(reference)? {
+            Ok(Box::new(move |batch| {
+                let column = project_column(&batch, idx)?;
+                compute_is_nan(&column)
+            }))
         } else {
             // A missing column, treating it as null.
             self.build_always_false()
@@ -1604,8 +1630,12 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
         reference: &BoundReference,
         _predicate: &BoundPredicate,
     ) -> Result<Box<PredicateResult>> {
-        if self.bound_reference(reference)?.is_some() {
-            self.build_always_false()
+        if let Some(idx) = self.bound_reference(reference)? {
+            Ok(Box::new(move |batch| {
+                let column = project_column(&batch, idx)?;
+                let is_nan = compute_is_nan(&column)?;
+                not(&is_nan)
+            }))
         } else {
             // A missing column, treating it as null.
             self.build_always_true()
@@ -2002,7 +2032,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::cast::AsArray;
-    use arrow_array::{ArrayRef, LargeStringArray, RecordBatch, StringArray};
+    use arrow_array::{Array, ArrayRef, BooleanArray, LargeStringArray, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema, TimeUnit};
     use futures::TryStreamExt;
     use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
@@ -5463,5 +5493,136 @@ message schema {
             "INT96 in map: got {}, expected {expected_micros}",
             ts_array.value(0)
         );
+    }
+
+    fn apply_predicate_to_batch(
+        predicate: Predicate,
+        schema: SchemaRef,
+        batch: RecordBatch,
+    ) -> BooleanArray {
+        use super::PredicateConverter;
+
+        let bound = predicate.bind(schema, true).unwrap();
+
+        // Build a trivial Parquet schema with one float column at field id 4
+        let message_type = "
+            message schema {
+              optional float qux = 4;
+            }
+        ";
+        let parquet_type = parse_message_type(message_type).expect("parse schema");
+        let parquet_schema = SchemaDescriptor::new(Arc::new(parquet_type));
+
+        let column_map = HashMap::from([(4i32, 0usize)]);
+        let column_indices = vec![0usize];
+
+        let mut converter = PredicateConverter {
+            parquet_schema: &parquet_schema,
+            column_map: &column_map,
+            column_indices: &column_indices,
+        };
+
+        let mut predicate_fn = visit(&mut converter, &bound).unwrap();
+        predicate_fn(batch).unwrap()
+    }
+
+    #[test]
+    fn test_predicate_converter_is_nan() {
+        use arrow_array::Float32Array;
+
+        let schema = table_schema_simple();
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![Field::new(
+                "qux",
+                DataType::Float32,
+                true,
+            )])),
+            vec![Arc::new(Float32Array::from(vec![
+                Some(1.0f32),
+                Some(f32::NAN),
+                None,
+                Some(f32::NAN),
+            ]))],
+        )
+        .unwrap();
+
+        let result = apply_predicate_to_batch(Reference::new("qux").is_nan(), schema, batch);
+
+        assert!(!result.value(0)); // 1.0 -> false
+        assert!(result.value(1)); // NaN -> true
+        assert!(result.value(3)); // NaN -> true
+    }
+
+    #[test]
+    fn test_predicate_converter_not_nan() {
+        use arrow_array::Float32Array;
+
+        let schema = table_schema_simple();
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![Field::new(
+                "qux",
+                DataType::Float32,
+                true,
+            )])),
+            vec![Arc::new(Float32Array::from(vec![
+                Some(1.0f32),
+                Some(f32::NAN),
+                None,
+                Some(0.0f32),
+            ]))],
+        )
+        .unwrap();
+
+        let result = apply_predicate_to_batch(Reference::new("qux").is_not_nan(), schema, batch);
+
+        assert!(result.value(0)); // 1.0 -> true (not NaN)
+        assert!(!result.value(1)); // NaN -> false
+        assert!(result.value(3)); // 0.0 -> true (not NaN)
+    }
+
+    #[test]
+    fn test_compute_is_nan_float32() {
+        use arrow_array::Float32Array;
+
+        let array: ArrayRef = Arc::new(Float32Array::from(vec![
+            Some(1.0f32),
+            Some(f32::NAN),
+            None,
+            Some(0.0f32),
+            Some(f32::NAN),
+        ]));
+        let result = super::compute_is_nan(&array).unwrap();
+
+        // NaN check: null values should remain null (not true)
+        assert!(!result.value(0)); // 1.0 is not NaN
+        assert!(result.value(1)); // NaN
+        assert!(result.is_null(2)); // null stays null
+        assert!(!result.value(3)); // 0.0 is not NaN
+        assert!(result.value(4)); // NaN
+    }
+
+    #[test]
+    fn test_compute_is_nan_float64() {
+        use arrow_array::Float64Array;
+
+        let array: ArrayRef = Arc::new(Float64Array::from(vec![Some(f64::NAN), Some(42.0), None]));
+        let result = super::compute_is_nan(&array).unwrap();
+
+        assert!(result.value(0)); // NaN
+        assert!(!result.value(1)); // 42.0 is not NaN
+        assert!(result.is_null(2)); // null stays null
+    }
+
+    #[test]
+    fn test_compute_is_nan_non_float() {
+        use arrow_array::Int32Array;
+
+        let array: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
+        let result = super::compute_is_nan(&array).unwrap();
+
+        // Non-float types: all false
+        assert!(!result.value(0));
+        assert!(!result.value(1));
+        assert!(!result.value(2));
     }
 }
