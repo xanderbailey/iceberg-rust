@@ -23,10 +23,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use arrow_arith::boolean::{and, and_kleene, is_not_null, is_null, not, or, or_kleene};
-use arrow_array::{
-    Array, ArrayRef, BooleanArray, Datum as ArrowDatum, Float32Array, Float64Array, RecordBatch,
-    Scalar,
-};
+use arrow_array::cast::AsArray;
+use arrow_array::types::{Float32Type, Float64Type};
+use arrow_array::{Array, ArrayRef, BooleanArray, Datum as ArrowDatum, RecordBatch, Scalar};
 use arrow_cast::cast::cast;
 use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
 use arrow_schema::{
@@ -1514,20 +1513,14 @@ fn project_column(
 
 fn compute_is_nan(array: &ArrayRef) -> std::result::Result<BooleanArray, ArrowError> {
     match array.data_type() {
-        DataType::Float32 => {
-            let float_array = array
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .ok_or_else(|| ArrowError::CastError("Expected Float32Array".to_string()))?;
-            Ok(BooleanArray::from_unary(float_array, |v| v.is_nan()))
-        }
-        DataType::Float64 => {
-            let float_array = array
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| ArrowError::CastError("Expected Float64Array".to_string()))?;
-            Ok(BooleanArray::from_unary(float_array, |v| v.is_nan()))
-        }
+        DataType::Float32 => Ok(BooleanArray::from_unary(
+            array.as_primitive::<Float32Type>(),
+            |v| v.is_nan(),
+        )),
+        DataType::Float64 => Ok(BooleanArray::from_unary(
+            array.as_primitive::<Float64Type>(),
+            |v| v.is_nan(),
+        )),
         _ => Ok(BooleanArray::from(vec![false; array.len()])),
     }
 }
