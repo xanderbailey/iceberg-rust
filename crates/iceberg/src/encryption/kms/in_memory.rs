@@ -54,13 +54,13 @@ fn lock_error<T>(e: PoisonError<T>) -> Error {
 #[derive(Clone)]
 pub struct InMemoryKeyManagementClient {
     master_keys: Arc<RwLock<HashMap<String, SensitiveBytes>>>,
-    key_size: AesKeySize,
+    master_key_size: AesKeySize,
 }
 
 impl fmt::Debug for InMemoryKeyManagementClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("InMemoryKeyManagementClient")
-            .field("key_size", &self.key_size)
+            .field("master_key_size", &self.master_key_size)
             .field("key_count", &self.key_count())
             .finish()
     }
@@ -77,21 +77,21 @@ impl InMemoryKeyManagementClient {
     pub fn new() -> Self {
         Self {
             master_keys: Arc::new(RwLock::new(HashMap::new())),
-            key_size: AesKeySize::Bits128,
+            master_key_size: AesKeySize::Bits128,
         }
     }
 
-    /// Creates a new in-memory KMS with the specified key size.
-    pub fn with_key_size(key_size: AesKeySize) -> Self {
+    /// Creates a new in-memory KMS with the specified master key size.
+    pub fn with_master_key_size(master_key_size: AesKeySize) -> Self {
         Self {
             master_keys: Arc::new(RwLock::new(HashMap::new())),
-            key_size,
+            master_key_size,
         }
     }
 
     /// Adds a randomly generated master key with the given ID.
     pub fn add_master_key(&self, key_id: impl Into<String>) -> Result<()> {
-        let key = SecureKey::generate(self.key_size);
+        let key = SecureKey::generate(self.master_key_size);
         self.insert_key(key_id.into(), SensitiveBytes::new(key.as_bytes()))
     }
 
@@ -266,8 +266,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_with_key_size() {
-        let kms = InMemoryKeyManagementClient::with_key_size(AesKeySize::Bits256);
+    async fn test_with_master_key_size() {
+        let kms = InMemoryKeyManagementClient::with_master_key_size(AesKeySize::Bits256);
         kms.add_master_key("master-256").unwrap();
 
         let dek = vec![0u8; 16];
