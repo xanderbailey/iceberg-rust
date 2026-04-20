@@ -72,7 +72,7 @@ static AVRO_SCHEMA_V1: LazyLock<AvroSchema> = LazyLock::new(|| {
 pub struct StandardKeyMetadata {
     encryption_key: SensitiveBytes,
     aad_prefix: Box<[u8]>,
-    file_length: Option<i64>,
+    file_length: Option<u64>,
 }
 
 impl fmt::Debug for StandardKeyMetadata {
@@ -95,6 +95,12 @@ impl StandardKeyMetadata {
         }
     }
 
+    /// Adds a file length
+    pub fn with_file_length(mut self, length: u64) -> Self {
+        self.file_length = Some(length);
+        self
+    }
+
     /// Returns the plaintext Data Encryption Key.
     pub fn encryption_key(&self) -> &[u8] {
         self.encryption_key.as_bytes()
@@ -106,7 +112,7 @@ impl StandardKeyMetadata {
     }
 
     /// Returns the optional file length.
-    pub fn file_length(&self) -> Option<i64> {
+    pub fn file_length(&self) -> Option<u64> {
         self.file_length
     }
 
@@ -181,7 +187,7 @@ impl StandardKeyMetadata {
 struct StandardKeyMetadataV1 {
     encryption_key: serde_bytes::ByteBuf,
     aad_prefix: Option<serde_bytes::ByteBuf>,
-    file_length: Option<i64>,
+    file_length: Option<u64>,
 }
 
 #[cfg(test)]
@@ -200,6 +206,21 @@ mod tests {
         assert_eq!(parsed.encryption_key(), key);
         assert_eq!(parsed.aad_prefix(), aad);
         assert_eq!(parsed.file_length(), None);
+    }
+
+    #[test]
+    fn test_roundtrip_with_length() {
+        let key = b"0123456789012345";
+        let aad = b"1234567890123456";
+
+        let file_length = 100_000;
+        let metadata = StandardKeyMetadata::new(key, aad).with_file_length(file_length);
+        let serialized = metadata.serialize().unwrap();
+        let parsed = StandardKeyMetadata::deserialize(&serialized).unwrap();
+
+        assert_eq!(parsed.encryption_key(), key);
+        assert_eq!(parsed.aad_prefix(), aad);
+        assert_eq!(parsed.file_length(), Some(file_length));
     }
 
     #[test]
