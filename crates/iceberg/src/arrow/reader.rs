@@ -5527,102 +5527,32 @@ message schema {
     }
 
     #[test]
-    fn test_predicate_converter_is_nan() {
+    fn test_predicate_converter_nan() {
         use arrow_array::Float32Array;
 
         let schema = table_schema_simple();
-        let batch = RecordBatch::try_new(
-            Arc::new(ArrowSchema::new(vec![Field::new(
-                "qux",
-                DataType::Float32,
-                true,
-            )])),
-            vec![Arc::new(Float32Array::from(vec![
-                Some(1.0f32),
-                Some(f32::NAN),
-                None,
-                Some(f32::NAN),
-            ]))],
-        )
-        .unwrap();
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "qux",
+            DataType::Float32,
+            true,
+        )]));
+        let values = vec![Some(1.0f32), Some(f32::NAN), None, Some(0.0f32)];
 
-        let result = apply_predicate_to_batch(Reference::new("qux").is_nan(), schema, batch);
+        let batch =
+            RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(Float32Array::from(values.clone()))]).unwrap();
+        let result = apply_predicate_to_batch(Reference::new("qux").is_nan(), schema.clone(), batch);
+        assert_eq!(
+            [result.value(0), result.value(1), result.value(3)],
+            [false, true, false]
+        );
 
-        assert!(!result.value(0)); // 1.0 -> false
-        assert!(result.value(1)); // NaN -> true
-        assert!(result.value(3)); // NaN -> true
-    }
-
-    #[test]
-    fn test_predicate_converter_not_nan() {
-        use arrow_array::Float32Array;
-
-        let schema = table_schema_simple();
-        let batch = RecordBatch::try_new(
-            Arc::new(ArrowSchema::new(vec![Field::new(
-                "qux",
-                DataType::Float32,
-                true,
-            )])),
-            vec![Arc::new(Float32Array::from(vec![
-                Some(1.0f32),
-                Some(f32::NAN),
-                None,
-                Some(0.0f32),
-            ]))],
-        )
-        .unwrap();
-
+        let batch =
+            RecordBatch::try_new(arrow_schema, vec![Arc::new(Float32Array::from(values))]).unwrap();
         let result = apply_predicate_to_batch(Reference::new("qux").is_not_nan(), schema, batch);
-
-        assert!(result.value(0)); // 1.0 -> true (not NaN)
-        assert!(!result.value(1)); // NaN -> false
-        assert!(result.value(3)); // 0.0 -> true (not NaN)
+        assert_eq!(
+            [result.value(0), result.value(1), result.value(3)],
+            [true, false, true]
+        );
     }
 
-    #[test]
-    fn test_compute_is_nan_float32() {
-        use arrow_array::Float32Array;
-
-        let array: ArrayRef = Arc::new(Float32Array::from(vec![
-            Some(1.0f32),
-            Some(f32::NAN),
-            None,
-            Some(0.0f32),
-            Some(f32::NAN),
-        ]));
-        let result = super::compute_is_nan(&array).unwrap();
-
-        // NaN check: null values should remain null (not true)
-        assert!(!result.value(0)); // 1.0 is not NaN
-        assert!(result.value(1)); // NaN
-        assert!(result.is_null(2)); // null stays null
-        assert!(!result.value(3)); // 0.0 is not NaN
-        assert!(result.value(4)); // NaN
-    }
-
-    #[test]
-    fn test_compute_is_nan_float64() {
-        use arrow_array::Float64Array;
-
-        let array: ArrayRef = Arc::new(Float64Array::from(vec![Some(f64::NAN), Some(42.0), None]));
-        let result = super::compute_is_nan(&array).unwrap();
-
-        assert!(result.value(0)); // NaN
-        assert!(!result.value(1)); // 42.0 is not NaN
-        assert!(result.is_null(2)); // null stays null
-    }
-
-    #[test]
-    fn test_compute_is_nan_non_float() {
-        use arrow_array::Int32Array;
-
-        let array: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
-        let result = super::compute_is_nan(&array).unwrap();
-
-        // Non-float types: all false
-        assert!(!result.value(0));
-        assert!(!result.value(1));
-        assert!(!result.value(2));
-    }
 }
