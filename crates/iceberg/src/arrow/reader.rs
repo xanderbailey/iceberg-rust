@@ -1515,8 +1515,7 @@ fn project_column(
 fn compute_is_nan(array: &ArrayRef) -> std::result::Result<BooleanArray, ArrowError> {
     // Compute NaN over the contiguous values slice, then fold the null bitmap
     // in with a single bitwise AND so that null slots become false.
-    // Per the Iceberg spec, is_nan is non-null-propagating: NULL → false.
-    let (values, nulls) = match array.data_type() {
+    let (is_nan, nulls) = match array.data_type() {
         DataType::Float32 => {
             let arr = array.as_primitive::<Float32Type>();
             (
@@ -1535,8 +1534,8 @@ fn compute_is_nan(array: &ArrayRef) -> std::result::Result<BooleanArray, ArrowEr
     };
 
     let values = match nulls {
-        Some(nulls) => &values & nulls.inner(),
-        None => values,
+        Some(nulls) => &is_nan & nulls.inner(),
+        None => is_nan,
     };
 
     Ok(BooleanArray::new(values, None))
