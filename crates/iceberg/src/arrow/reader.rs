@@ -1512,16 +1512,41 @@ fn project_column(
 }
 
 fn compute_is_nan(array: &ArrayRef) -> std::result::Result<BooleanArray, ArrowError> {
+    // Per the Iceberg spec, is_nan is non-null-propagating: NULL → false.
+    // When there are no nulls, from_unary is a fast vectorized path.
+    // When there are nulls, we iterate to avoid propagating them.
+    if array.null_count() == 0 {
+        return match array.data_type() {
+            DataType::Float32 => Ok(BooleanArray::from_unary(
+                array.as_primitive::<Float32Type>(),
+                |v| v.is_nan(),
+            )),
+            DataType::Float64 => Ok(BooleanArray::from_unary(
+                array.as_primitive::<Float64Type>(),
+                |v| v.is_nan(),
+            )),
+            _ => unreachable!("is_nan is only valid for float types"),
+        };
+    }
+
     match array.data_type() {
-        DataType::Float32 => Ok(BooleanArray::from_unary(
-            array.as_primitive::<Float32Type>(),
-            |v| v.is_nan(),
-        )),
-        DataType::Float64 => Ok(BooleanArray::from_unary(
-            array.as_primitive::<Float64Type>(),
-            |v| v.is_nan(),
-        )),
-        _ => Ok(BooleanArray::from(vec![false; array.len()])),
+        DataType::Float32 => {
+            let arr = array.as_primitive::<Float32Type>();
+            Ok(BooleanArray::from(
+                (0..arr.len())
+                    .map(|i| arr.is_valid(i) && arr.value(i).is_nan())
+                    .collect::<Vec<_>>(),
+            ))
+        }
+        DataType::Float64 => {
+            let arr = array.as_primitive::<Float64Type>();
+            Ok(BooleanArray::from(
+                (0..arr.len())
+                    .map(|i| arr.is_valid(i) && arr.value(i).is_nan())
+                    .collect::<Vec<_>>(),
+            ))
+        }
+        _ => unreachable!("is_nan is only valid for float types"),
     }
 }
 
@@ -5531,21 +5556,28 @@ message schema {
         )]));
         let values = vec![Some(1.0f32), Some(f32::NAN), None, Some(0.0f32)];
 
-        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(Float32Array::from(
-            values.clone(),
-        ))])
+        // is_nan: non-null-propagating per Iceberg spec — NULL → false
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Float32Array::from(values.clone()))],
+        )
         .unwrap();
         let result =
             apply_predicate_to_batch(Reference::new("qux").is_nan(), schema.clone(), batch);
-        assert_eq!([result.value(0), result.value(1), result.value(3)], [
-            false, true, false
-        ]);
+        assert_eq!(
+            [result.value(0), result.value(1), result.value(2), result.value(3)],
+            [false, true, false, false]
+        );
+        assert!(!result.is_null(2));
 
+        // not_nan: non-null-propagating per Iceberg spec — NULL → true
         let batch =
             RecordBatch::try_new(arrow_schema, vec![Arc::new(Float32Array::from(values))]).unwrap();
         let result = apply_predicate_to_batch(Reference::new("qux").is_not_nan(), schema, batch);
-        assert_eq!([result.value(0), result.value(1), result.value(3)], [
-            true, false, true
-        ]);
+        assert_eq!(
+            [result.value(0), result.value(1), result.value(2), result.value(3)],
+            [true, false, true, true]
+        );
+        assert!(!result.is_null(2));
     }
 }
