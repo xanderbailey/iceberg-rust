@@ -38,10 +38,10 @@ fn lock_error<T>(e: PoisonError<T>) -> Error {
 ///
 /// ```
 /// use iceberg::encryption::KeyManagementClient;
-/// use iceberg::encryption::kms::InMemoryKeyManagementClient;
+/// use iceberg::encryption::kms::MemoryKeyManagementClient;
 ///
 /// # async fn example() -> iceberg::Result<()> {
-/// let kms = InMemoryKeyManagementClient::new();
+/// let kms = MemoryKeyManagementClient::new();
 /// kms.add_master_key("my-master-key")?;
 ///
 /// let dek = vec![0u8; 16];
@@ -52,27 +52,27 @@ fn lock_error<T>(e: PoisonError<T>) -> Error {
 /// # }
 /// ```
 #[derive(Clone)]
-pub struct InMemoryKeyManagementClient {
+pub struct MemoryKeyManagementClient {
     master_keys: Arc<RwLock<HashMap<String, SensitiveBytes>>>,
     master_key_size: AesKeySize,
 }
 
-impl fmt::Debug for InMemoryKeyManagementClient {
+impl fmt::Debug for MemoryKeyManagementClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("InMemoryKeyManagementClient")
+        f.debug_struct("MemoryKeyManagementClient")
             .field("master_key_size", &self.master_key_size)
             .field("key_count", &self.key_count())
             .finish()
     }
 }
 
-impl Default for InMemoryKeyManagementClient {
+impl Default for MemoryKeyManagementClient {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl InMemoryKeyManagementClient {
+impl MemoryKeyManagementClient {
     /// Creates a new in-memory KMS with 128-bit AES keys.
     pub fn new() -> Self {
         Self {
@@ -145,7 +145,7 @@ impl InMemoryKeyManagementClient {
 }
 
 #[async_trait]
-impl KeyManagementClient for InMemoryKeyManagementClient {
+impl KeyManagementClient for MemoryKeyManagementClient {
     async fn wrap_key(&self, key: &[u8], wrapping_key_id: &str) -> Result<Vec<u8>> {
         let master_key_bytes = self.get_master_key(wrapping_key_id)?;
         let master_key = SecureKey::new(master_key_bytes.as_bytes())?;
@@ -173,7 +173,7 @@ impl KeyManagementClient for InMemoryKeyManagementClient {
     async fn generate_key(&self, _wrapping_key_id: &str) -> Result<super::GeneratedKey> {
         Err(Error::new(
             ErrorKind::FeatureUnsupported,
-            "InMemoryKeyManagementClient does not support server-side key generation",
+            "MemoryKeyManagementClient does not support server-side key generation",
         ))
     }
 }
@@ -184,7 +184,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_wrap_unwrap_roundtrip() {
-        let kms = InMemoryKeyManagementClient::new();
+        let kms = MemoryKeyManagementClient::new();
         kms.add_master_key("master-1").unwrap();
         let dek = vec![0u8; 16];
 
@@ -195,7 +195,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_wrap_unknown_key_fails() {
-        let kms = InMemoryKeyManagementClient::new();
+        let kms = MemoryKeyManagementClient::new();
         let dek = vec![0u8; 16];
 
         let result = kms.wrap_key(&dek, "nonexistent").await;
@@ -204,7 +204,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_wrong_master_key_fails_unwrap() {
-        let kms = InMemoryKeyManagementClient::new();
+        let kms = MemoryKeyManagementClient::new();
         kms.add_master_key("master-1").unwrap();
         kms.add_master_key("master-2").unwrap();
         let dek = vec![0u8; 16];
@@ -217,7 +217,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_does_not_support_key_generation() {
-        let kms = InMemoryKeyManagementClient::new();
+        let kms = MemoryKeyManagementClient::new();
         assert!(!kms.supports_key_generation());
 
         let result = kms.generate_key("master-1").await;
@@ -226,7 +226,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiple_master_keys() {
-        let kms = InMemoryKeyManagementClient::new();
+        let kms = MemoryKeyManagementClient::new();
         kms.add_master_key("master-1").unwrap();
         kms.add_master_key("master-2").unwrap();
         let dek1 = vec![1u8; 16];
@@ -244,7 +244,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_master_key() {
-        let kms = InMemoryKeyManagementClient::new();
+        let kms = MemoryKeyManagementClient::new();
 
         kms.add_master_key("my-key").unwrap();
         assert!(kms.has_key("my-key"));
@@ -256,7 +256,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_master_key_bytes() {
-        let kms = InMemoryKeyManagementClient::new();
+        let kms = MemoryKeyManagementClient::new();
         let key_bytes = [42u8; 16];
 
         kms.add_master_key_bytes("my-key", &key_bytes).unwrap();
@@ -270,7 +270,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_master_key_bytes_invalid_length() {
-        let kms = InMemoryKeyManagementClient::new();
+        let kms = MemoryKeyManagementClient::new();
 
         let result = kms.add_master_key_bytes("my-key", &[0u8; 7]);
         assert!(result.is_err());
@@ -278,7 +278,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_with_master_key_size() {
-        let kms = InMemoryKeyManagementClient::with_master_key_size(AesKeySize::Bits256);
+        let kms = MemoryKeyManagementClient::with_master_key_size(AesKeySize::Bits256);
         kms.add_master_key("master-256").unwrap();
 
         let dek = vec![0u8; 16];
@@ -289,7 +289,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_clone_shares_state() {
-        let kms1 = InMemoryKeyManagementClient::new();
+        let kms1 = MemoryKeyManagementClient::new();
         let kms2 = kms1.clone();
 
         kms1.add_master_key("shared-key").unwrap();

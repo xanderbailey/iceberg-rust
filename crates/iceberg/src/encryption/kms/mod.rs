@@ -21,7 +21,7 @@
 //! integration and implementations for different key management systems.
 
 mod client;
-mod in_memory;
+mod memory;
 
 pub use client::{GeneratedKey, KeyManagementClient};
-pub use in_memory::InMemoryKeyManagementClient;
+pub use memory::MemoryKeyManagementClient;
