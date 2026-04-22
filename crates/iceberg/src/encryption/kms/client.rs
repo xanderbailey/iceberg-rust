@@ -31,10 +31,25 @@ use crate::Result;
 /// Returned by [`KeyManagementClient::generate_key`] when the KMS supports
 /// atomic key generation and wrapping.
 pub struct GeneratedKey {
-    /// The plaintext key bytes. Zeroized on drop, redacted in Debug.
-    pub key: SensitiveBytes,
-    /// The wrapped (encrypted) key bytes.
-    pub wrapped_key: Vec<u8>,
+    key: SensitiveBytes,
+    wrapped_key: Vec<u8>,
+}
+
+impl GeneratedKey {
+    /// Creates a new `GeneratedKey` from plaintext key bytes and wrapped key bytes.
+    pub fn new(key: SensitiveBytes, wrapped_key: Vec<u8>) -> Self {
+        Self { key, wrapped_key }
+    }
+
+    /// Returns the plaintext key bytes. Zeroized on drop, redacted in Debug.
+    pub fn key(&self) -> &SensitiveBytes {
+        &self.key
+    }
+
+    /// Returns the wrapped (encrypted) key bytes.
+    pub fn wrapped_key(&self) -> &[u8] {
+        &self.wrapped_key
+    }
 }
 
 /// Pluggable interface for key management systems (AWS KMS, Azure Key Vault, etc.).
