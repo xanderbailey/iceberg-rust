@@ -165,6 +165,17 @@ impl KeyManagementClient for InMemoryKeyManagementClient {
 
         Ok(SensitiveBytes::new(cipher.decrypt(wrapped_key, None)?))
     }
+
+    fn supports_key_generation(&self) -> bool {
+        false
+    }
+
+    async fn generate_key(&self, _wrapping_key_id: &str) -> Result<super::GeneratedKey> {
+        Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            "InMemoryKeyManagementClient does not support server-side key generation",
+        ))
+    }
 }
 
 #[cfg(test)]

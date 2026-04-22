@@ -24,7 +24,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::encryption::SensitiveBytes;
-use crate::{Error, ErrorKind, Result};
+use crate::Result;
 
 /// Result of a server-side key generation operation.
 ///
@@ -52,20 +52,13 @@ pub trait KeyManagementClient: Send + Sync + std::fmt::Debug {
     /// If `true`, callers can use [`generate_key`](Self::generate_key) for atomic
     /// key generation and wrapping, which is more secure than generating a key
     /// locally and then wrapping it.
-    fn supports_key_generation(&self) -> bool {
-        false
-    }
+    fn supports_key_generation(&self) -> bool;
 
     /// Generate a new key and wrap it atomically on the server side.
     ///
     /// This is only supported when [`supports_key_generation`](Self::supports_key_generation)
-    /// returns `true`. The default implementation returns `FeatureUnsupported`.
-    async fn generate_key(&self, _wrapping_key_id: &str) -> Result<GeneratedKey> {
-        Err(Error::new(
-            ErrorKind::FeatureUnsupported,
-            "This KMS client does not support server-side key generation",
-        ))
-    }
+    /// returns `true`.
+    async fn generate_key(&self, wrapping_key_id: &str) -> Result<GeneratedKey>;
 }
 
 #[async_trait]
