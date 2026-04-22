@@ -23,8 +23,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::encryption::SensitiveBytes;
 use crate::Result;
+use crate::encryption::SensitiveBytes;
 
 /// Result of a server-side key generation operation.
 ///
