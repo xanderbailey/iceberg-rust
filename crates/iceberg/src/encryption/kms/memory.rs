@@ -51,7 +51,7 @@ fn lock_error<T>(e: PoisonError<T>) -> Error {
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct MemoryKeyManagementClient {
     master_keys: Arc<RwLock<HashMap<String, SensitiveBytes>>>,
     master_key_size: AesKeySize,
@@ -63,12 +63,6 @@ impl fmt::Debug for MemoryKeyManagementClient {
             .field("master_key_size", &self.master_key_size)
             .field("key_count", &self.key_count())
             .finish()
-    }
-}
-
-impl Default for MemoryKeyManagementClient {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

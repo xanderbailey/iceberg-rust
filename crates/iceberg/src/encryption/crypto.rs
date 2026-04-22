@@ -83,9 +83,10 @@ impl fmt::Display for SensitiveBytes {
 ///
 /// The Iceberg spec supports 128, 192, and 256-bit keys for AES-GCM.
 /// See: <https://iceberg.apache.org/gcm-stream-spec/#goals>
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum AesKeySize {
-    /// 128-bit AES key (16 bytes)
+    /// 128-bit AES key (16 bytes). Default per the Iceberg spec.
+    #[default]
     Bits128 = 128,
     /// 192-bit AES key (24 bytes)
     Bits192 = 192,
