@@ -148,44 +148,42 @@ impl StandardKeyMetadata {
 }
 
 mod _serde {
-    use std::sync::LazyLock;
+    use std::sync::{Arc, LazyLock};
 
     use apache_avro::Schema as AvroSchema;
     use serde::{Deserialize, Serialize};
 
     use super::*;
+    use crate::avro::schema_to_avro_schema;
+    use crate::spec::{NestedField, PrimitiveType, Schema, Type};
 
     pub(super) const V1: u8 = 1;
 
-    /// Avro schema for StandardKeyMetadata V1, matching Java's layout.
+    /// Avro schema for StandardKeyMetadata V1, derived from Iceberg schema.
     pub(super) static AVRO_SCHEMA_V1: LazyLock<AvroSchema> = LazyLock::new(|| {
-        AvroSchema::parse_str(
-            r#"{
-                "type": "record",
-                "name": "StandardKeyMetadata",
-                "namespace": "org.apache.iceberg.encryption",
-                "fields": [
-                    {
-                        "name": "encryption_key",
-                        "type": "bytes",
-                        "field-id": 0
-                    },
-                    {
-                        "name": "aad_prefix",
-                        "type": ["null", "bytes"],
-                        "default": null,
-                        "field-id": 1
-                    },
-                    {
-                        "name": "file_length",
-                        "type": ["null", "long"],
-                        "default": null,
-                        "field-id": 2
-                    }
-                ]
-            }"#,
-        )
-        .expect("Failed to parse StandardKeyMetadata Avro schema")
+        let schema = Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::required(
+                    0,
+                    "encryption_key",
+                    Type::Primitive(PrimitiveType::Binary),
+                )),
+                Arc::new(NestedField::optional(
+                    1,
+                    "aad_prefix",
+                    Type::Primitive(PrimitiveType::Binary),
+                )),
+                Arc::new(NestedField::optional(
+                    2,
+                    "file_length",
+                    Type::Primitive(PrimitiveType::Long),
+                )),
+            ])
+            .build()
+            .expect("Failed to build StandardKeyMetadata Iceberg schema");
+
+        schema_to_avro_schema("StandardKeyMetadata", &schema)
+            .expect("Failed to convert StandardKeyMetadata to Avro schema")
     });
 
     /// Serde struct for Avro serialization of [`StandardKeyMetadata`] V1.
