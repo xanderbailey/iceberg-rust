@@ -19,8 +19,6 @@
 //!
 //! Mirrors the Java `KeyManagementClient` interface from the Apache Iceberg spec.
 
-use std::sync::Arc;
-
 use async_trait::async_trait;
 
 use crate::Result;
@@ -77,7 +75,7 @@ pub trait KeyManagementClient: Send + Sync + std::fmt::Debug {
 }
 
 #[async_trait]
-impl KeyManagementClient for Arc<dyn KeyManagementClient> {
+impl<T: AsRef<dyn KeyManagementClient> + Send + Sync + std::fmt::Debug> KeyManagementClient for T {
     async fn wrap_key(&self, key: &[u8], wrapping_key_id: &str) -> Result<Vec<u8>> {
         self.as_ref().wrap_key(key, wrapping_key_id).await
     }
