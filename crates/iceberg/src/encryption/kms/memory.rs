@@ -22,17 +22,14 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 
 use super::KeyManagementClient;
 use crate::encryption::{AesGcmCipher, AesKeySize, SecureKey, SensitiveBytes};
+use crate::error::lock_error;
 use crate::{Error, ErrorKind, Result};
-
-fn lock_error<T>(e: PoisonError<T>) -> Error {
-    Error::new(ErrorKind::Unexpected, format!("Lock poisoned: {e}"))
-}
 
 /// In-memory KMS for testing. Not suitable for production use.
 ///
@@ -69,10 +66,7 @@ impl fmt::Debug for MemoryKeyManagementClient {
 impl MemoryKeyManagementClient {
     /// Creates a new in-memory KMS with 128-bit AES keys.
     pub fn new() -> Self {
-        Self {
-            master_keys: Arc::new(RwLock::new(HashMap::new())),
-            master_key_size: AesKeySize::Bits128,
-        }
+        Self::default()
     }
 
     /// Creates a new in-memory KMS with the specified master key size.
@@ -94,9 +88,13 @@ impl MemoryKeyManagementClient {
     /// Use this to seed the KMS with known key material, e.g. for
     /// cross-language integration tests where both Java and Rust must
     /// share the same master key bytes.
-    pub fn add_master_key_bytes(&self, key_id: impl Into<String>, key_bytes: &[u8]) -> Result<()> {
-        let _ = SecureKey::new(key_bytes)?;
-        self.insert_key(key_id.into(), SensitiveBytes::new(key_bytes))
+    pub fn add_master_key_bytes(
+        &self,
+        key_id: impl Into<String>,
+        key_bytes: SensitiveBytes,
+    ) -> Result<()> {
+        let _ = SecureKey::new(key_bytes.as_bytes())?;
+        self.insert_key(key_id.into(), key_bytes)
     }
 
     fn insert_key(&self, key_id: String, key: SensitiveBytes) -> Result<()> {
@@ -251,9 +249,9 @@ mod tests {
     #[tokio::test]
     async fn test_add_master_key_bytes() {
         let kms = MemoryKeyManagementClient::new();
-        let key_bytes = [42u8; 16];
+        let key_bytes = SensitiveBytes::new([42u8; 16]);
 
-        kms.add_master_key_bytes("my-key", &key_bytes).unwrap();
+        kms.add_master_key_bytes("my-key", key_bytes).unwrap();
         assert!(kms.has_key("my-key"));
 
         let dek = vec![7u8; 16];
@@ -266,7 +264,7 @@ mod tests {
     async fn test_add_master_key_bytes_invalid_length() {
         let kms = MemoryKeyManagementClient::new();
 
-        let result = kms.add_master_key_bytes("my-key", &[0u8; 7]);
+        let result = kms.add_master_key_bytes("my-key", SensitiveBytes::new([0u8; 7]));
         assert!(result.is_err());
     }
 
