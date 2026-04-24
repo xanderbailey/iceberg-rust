@@ -71,7 +71,7 @@ static AVRO_SCHEMA_V1: LazyLock<AvroSchema> = LazyLock::new(|| {
 #[derive(Clone, PartialEq, Eq)]
 pub struct StandardKeyMetadata {
     encryption_key: SensitiveBytes,
-    aad_prefix: Box<[u8]>,
+    aad_prefix: Option<Box<[u8]>>,
     file_length: Option<u64>,
 }
 
@@ -79,7 +79,13 @@ impl fmt::Debug for StandardKeyMetadata {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StandardKeyMetadata")
             .field("encryption_key", &self.encryption_key)
-            .field("aad_prefix", &format!("[{} bytes]", self.aad_prefix.len()))
+            .field(
+                "aad_prefix",
+                &self
+                    .aad_prefix
+                    .as_ref()
+                    .map(|b| format!("[{} bytes]", b.len())),
+            )
             .field("file_length", &self.file_length)
             .finish()
     }
@@ -87,15 +93,21 @@ impl fmt::Debug for StandardKeyMetadata {
 
 impl StandardKeyMetadata {
     /// Creates a new `StandardKeyMetadata`.
-    pub fn new(encryption_key: &[u8], aad_prefix: &[u8]) -> Self {
+    pub fn new(encryption_key: &[u8]) -> Self {
         Self {
             encryption_key: SensitiveBytes::new(encryption_key),
-            aad_prefix: aad_prefix.into(),
+            aad_prefix: None,
             file_length: None,
         }
     }
 
-    /// Adds a file length
+    /// Adds an AAD prefix.
+    pub fn with_aad_prefix(mut self, aad_prefix: &[u8]) -> Self {
+        self.aad_prefix = Some(aad_prefix.into());
+        self
+    }
+
+    /// Adds a file length.
     pub fn with_file_length(mut self, length: u64) -> Self {
         self.file_length = Some(length);
         self
@@ -107,8 +119,8 @@ impl StandardKeyMetadata {
     }
 
     /// Returns the AAD prefix.
-    pub fn aad_prefix(&self) -> &[u8] {
-        &self.aad_prefix
+    pub fn aad_prefix(&self) -> Option<&[u8]> {
+        self.aad_prefix.as_deref()
     }
 
     /// Returns the optional file length.
@@ -120,7 +132,10 @@ impl StandardKeyMetadata {
     pub fn serialize(&self) -> Result<Box<[u8]>> {
         let serde_repr = StandardKeyMetadataV1 {
             encryption_key: serde_bytes::ByteBuf::from(self.encryption_key.as_bytes()),
-            aad_prefix: Some(serde_bytes::ByteBuf::from(self.aad_prefix.as_ref())),
+            aad_prefix: self
+                .aad_prefix
+                .as_ref()
+                .map(|b| serde_bytes::ByteBuf::from(b.as_ref())),
             file_length: self.file_length,
         };
 
@@ -172,10 +187,7 @@ impl StandardKeyMetadata {
 
         Ok(Self {
             encryption_key: SensitiveBytes::new(v1.encryption_key.into_vec()),
-            aad_prefix: v1
-                .aad_prefix
-                .map(|b| b.into_vec().into_boxed_slice())
-                .unwrap_or_default(),
+            aad_prefix: v1.aad_prefix.map(|b| b.into_vec().into_boxed_slice()),
             file_length: v1.file_length,
         })
     }
@@ -199,12 +211,12 @@ mod tests {
         let key = b"0123456789012345";
         let aad = b"1234567890123456";
 
-        let metadata = StandardKeyMetadata::new(key, aad);
+        let metadata = StandardKeyMetadata::new(key).with_aad_prefix(aad);
         let serialized = metadata.serialize().unwrap();
         let parsed = StandardKeyMetadata::deserialize(&serialized).unwrap();
 
         assert_eq!(parsed.encryption_key(), key);
-        assert_eq!(parsed.aad_prefix(), aad);
+        assert_eq!(parsed.aad_prefix(), Some(aad.as_slice()));
         assert_eq!(parsed.file_length(), None);
     }
 
@@ -214,12 +226,14 @@ mod tests {
         let aad = b"1234567890123456";
 
         let file_length = 100_000;
-        let metadata = StandardKeyMetadata::new(key, aad).with_file_length(file_length);
+        let metadata = StandardKeyMetadata::new(key)
+            .with_aad_prefix(aad)
+            .with_file_length(file_length);
         let serialized = metadata.serialize().unwrap();
         let parsed = StandardKeyMetadata::deserialize(&serialized).unwrap();
 
         assert_eq!(parsed.encryption_key(), key);
-        assert_eq!(parsed.aad_prefix(), aad);
+        assert_eq!(parsed.aad_prefix(), Some(aad.as_slice()));
         assert_eq!(parsed.file_length(), Some(file_length));
     }
 
@@ -239,12 +253,12 @@ mod tests {
     }
 
     #[test]
-    fn test_roundtrip_with_empty_aad() {
-        let metadata = StandardKeyMetadata::new(&[1, 2, 3, 4], &[]);
+    fn test_roundtrip_without_aad() {
+        let metadata = StandardKeyMetadata::new(&[1, 2, 3, 4]);
         let serialized = metadata.serialize().unwrap();
         let parsed = StandardKeyMetadata::deserialize(&serialized).unwrap();
 
         assert_eq!(parsed.encryption_key(), &[1, 2, 3, 4]);
-        assert_eq!(parsed.aad_prefix(), &[] as &[u8]);
+        assert_eq!(parsed.aad_prefix(), None);
     }
 }
