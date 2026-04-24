@@ -20,46 +20,11 @@
 
 use std::fmt;
 use std::io::Cursor;
-use std::sync::LazyLock;
 
-use apache_avro::{Schema as AvroSchema, from_avro_datum, from_value, to_avro_datum, to_value};
-use serde::{Deserialize, Serialize};
+use apache_avro::{from_avro_datum, from_value, to_avro_datum, to_value};
 
 use super::SensitiveBytes;
 use crate::{Error, ErrorKind, Result};
-
-const V1: u8 = 1;
-
-/// Avro schema for StandardKeyMetadata V1, matching Java's layout.
-static AVRO_SCHEMA_V1: LazyLock<AvroSchema> = LazyLock::new(|| {
-    AvroSchema::parse_str(
-        r#"{
-            "type": "record",
-            "name": "StandardKeyMetadata",
-            "namespace": "org.apache.iceberg.encryption",
-            "fields": [
-                {
-                    "name": "encryption_key",
-                    "type": "bytes",
-                    "field-id": 0
-                },
-                {
-                    "name": "aad_prefix",
-                    "type": ["null", "bytes"],
-                    "default": null,
-                    "field-id": 1
-                },
-                {
-                    "name": "file_length",
-                    "type": ["null", "long"],
-                    "default": null,
-                    "field-id": 2
-                }
-            ]
-        }"#,
-    )
-    .expect("Failed to parse StandardKeyMetadata Avro schema")
-});
 
 /// Standard key metadata for Iceberg table encryption.
 ///
@@ -128,35 +93,28 @@ impl StandardKeyMetadata {
         self.file_length
     }
 
-    /// Serializes to Java-compatible format: `[0x01] [Avro binary datum]`
-    pub fn serialize(&self) -> Result<Box<[u8]>> {
-        let serde_repr = StandardKeyMetadataV1 {
-            encryption_key: serde_bytes::ByteBuf::from(self.encryption_key.as_bytes()),
-            aad_prefix: self
-                .aad_prefix
-                .as_ref()
-                .map(|b| serde_bytes::ByteBuf::from(b.as_ref())),
-            file_length: self.file_length,
-        };
+    /// Encodes to Java-compatible format: `[0x01] [Avro binary datum]`
+    pub fn encode(&self) -> Result<Box<[u8]>> {
+        let serde_repr = _serde::StandardKeyMetadataV1::from(self);
 
         let value = to_value(serde_repr)
-            .and_then(|v| v.resolve(&AVRO_SCHEMA_V1))
+            .and_then(|v| v.resolve(&_serde::AVRO_SCHEMA_V1))
             .map_err(|e| {
-                Error::new(ErrorKind::Unexpected, "Failed to serialize key metadata").with_source(e)
+                Error::new(ErrorKind::Unexpected, "Failed to encode key metadata").with_source(e)
             })?;
 
-        let datum = to_avro_datum(&AVRO_SCHEMA_V1, value).map_err(|e| {
-            Error::new(ErrorKind::Unexpected, "Failed to serialize key metadata").with_source(e)
+        let datum = to_avro_datum(&_serde::AVRO_SCHEMA_V1, value).map_err(|e| {
+            Error::new(ErrorKind::Unexpected, "Failed to encode key metadata").with_source(e)
         })?;
 
         let mut result = Vec::with_capacity(1 + datum.len());
-        result.push(V1);
+        result.push(_serde::V1);
         result.extend_from_slice(&datum);
         Ok(result.into_boxed_slice())
     }
 
-    /// Deserializes from Java-compatible format.
-    pub fn deserialize(bytes: &[u8]) -> Result<Self> {
+    /// Decodes from Java-compatible format.
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
         if bytes.is_empty() {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
@@ -165,7 +123,7 @@ impl StandardKeyMetadata {
         }
 
         let version = bytes[0];
-        if version != V1 {
+        if version != _serde::V1 {
             return Err(Error::new(
                 ErrorKind::FeatureUnsupported,
                 format!("Cannot resolve schema for version: {version}"),
@@ -173,33 +131,94 @@ impl StandardKeyMetadata {
         }
 
         let mut reader = Cursor::new(&bytes[1..]);
-        let value = from_avro_datum(&AVRO_SCHEMA_V1, &mut reader, None).map_err(|e| {
-            Error::new(ErrorKind::DataInvalid, "Failed to parse key metadata").with_source(e)
+        let value = from_avro_datum(&_serde::AVRO_SCHEMA_V1, &mut reader, None).map_err(|e| {
+            Error::new(ErrorKind::DataInvalid, "Failed to decode key metadata").with_source(e)
         })?;
 
-        let v1: StandardKeyMetadataV1 = from_value(&value).map_err(|e| {
+        let v1: _serde::StandardKeyMetadataV1 = from_value(&value).map_err(|e| {
             Error::new(
                 ErrorKind::DataInvalid,
-                "Failed to deserialize key metadata fields",
+                "Failed to decode key metadata fields",
             )
             .with_source(e)
         })?;
 
-        Ok(Self {
-            encryption_key: SensitiveBytes::new(v1.encryption_key.into_vec()),
-            aad_prefix: v1.aad_prefix.map(|b| b.into_vec().into_boxed_slice()),
-            file_length: v1.file_length,
-        })
+        Ok(Self::from(v1))
     }
 }
 
-/// Serde struct for Avro serialization of [`StandardKeyMetadata`] V1.
-/// Field names must match [`AVRO_SCHEMA_V1`] exactly.
-#[derive(Serialize, Deserialize)]
-struct StandardKeyMetadataV1 {
-    encryption_key: serde_bytes::ByteBuf,
-    aad_prefix: Option<serde_bytes::ByteBuf>,
-    file_length: Option<u64>,
+mod _serde {
+    use std::sync::LazyLock;
+
+    use apache_avro::Schema as AvroSchema;
+    use serde::{Deserialize, Serialize};
+
+    use super::*;
+
+    pub(super) const V1: u8 = 1;
+
+    /// Avro schema for StandardKeyMetadata V1, matching Java's layout.
+    pub(super) static AVRO_SCHEMA_V1: LazyLock<AvroSchema> = LazyLock::new(|| {
+        AvroSchema::parse_str(
+            r#"{
+                "type": "record",
+                "name": "StandardKeyMetadata",
+                "namespace": "org.apache.iceberg.encryption",
+                "fields": [
+                    {
+                        "name": "encryption_key",
+                        "type": "bytes",
+                        "field-id": 0
+                    },
+                    {
+                        "name": "aad_prefix",
+                        "type": ["null", "bytes"],
+                        "default": null,
+                        "field-id": 1
+                    },
+                    {
+                        "name": "file_length",
+                        "type": ["null", "long"],
+                        "default": null,
+                        "field-id": 2
+                    }
+                ]
+            }"#,
+        )
+        .expect("Failed to parse StandardKeyMetadata Avro schema")
+    });
+
+    /// Serde struct for Avro serialization of [`StandardKeyMetadata`] V1.
+    /// Field names must match [`AVRO_SCHEMA_V1`] exactly.
+    #[derive(Serialize, Deserialize)]
+    pub(super) struct StandardKeyMetadataV1 {
+        pub encryption_key: serde_bytes::ByteBuf,
+        pub aad_prefix: Option<serde_bytes::ByteBuf>,
+        pub file_length: Option<u64>,
+    }
+
+    impl From<&StandardKeyMetadata> for StandardKeyMetadataV1 {
+        fn from(metadata: &StandardKeyMetadata) -> Self {
+            Self {
+                encryption_key: serde_bytes::ByteBuf::from(metadata.encryption_key.as_bytes()),
+                aad_prefix: metadata
+                    .aad_prefix
+                    .as_ref()
+                    .map(|b| serde_bytes::ByteBuf::from(b.as_ref())),
+                file_length: metadata.file_length,
+            }
+        }
+    }
+
+    impl From<StandardKeyMetadataV1> for StandardKeyMetadata {
+        fn from(v1: StandardKeyMetadataV1) -> Self {
+            Self {
+                encryption_key: SensitiveBytes::new(v1.encryption_key.into_vec()),
+                aad_prefix: v1.aad_prefix.map(|b| b.into_vec().into_boxed_slice()),
+                file_length: v1.file_length,
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -212,8 +231,8 @@ mod tests {
         let aad = b"1234567890123456";
 
         let metadata = StandardKeyMetadata::new(key).with_aad_prefix(aad);
-        let serialized = metadata.serialize().unwrap();
-        let parsed = StandardKeyMetadata::deserialize(&serialized).unwrap();
+        let serialized = metadata.encode().unwrap();
+        let parsed = StandardKeyMetadata::decode(&serialized).unwrap();
 
         assert_eq!(parsed.encryption_key(), key);
         assert_eq!(parsed.aad_prefix(), Some(aad.as_slice()));
@@ -229,8 +248,8 @@ mod tests {
         let metadata = StandardKeyMetadata::new(key)
             .with_aad_prefix(aad)
             .with_file_length(file_length);
-        let serialized = metadata.serialize().unwrap();
-        let parsed = StandardKeyMetadata::deserialize(&serialized).unwrap();
+        let serialized = metadata.encode().unwrap();
+        let parsed = StandardKeyMetadata::decode(&serialized).unwrap();
 
         assert_eq!(parsed.encryption_key(), key);
         assert_eq!(parsed.aad_prefix(), Some(aad.as_slice()));
@@ -239,7 +258,7 @@ mod tests {
 
     #[test]
     fn test_unsupported_version() {
-        let result = StandardKeyMetadata::deserialize(&[0x02]);
+        let result = StandardKeyMetadata::decode(&[0x02]);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
@@ -247,7 +266,7 @@ mod tests {
 
     #[test]
     fn test_empty_buffer() {
-        let result = StandardKeyMetadata::deserialize(&[]);
+        let result = StandardKeyMetadata::decode(&[]);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind(), ErrorKind::DataInvalid);
     }
@@ -255,8 +274,8 @@ mod tests {
     #[test]
     fn test_roundtrip_without_aad() {
         let metadata = StandardKeyMetadata::new(&[1, 2, 3, 4]);
-        let serialized = metadata.serialize().unwrap();
-        let parsed = StandardKeyMetadata::deserialize(&serialized).unwrap();
+        let serialized = metadata.encode().unwrap();
+        let parsed = StandardKeyMetadata::decode(&serialized).unwrap();
 
         assert_eq!(parsed.encryption_key(), &[1, 2, 3, 4]);
         assert_eq!(parsed.aad_prefix(), None);
