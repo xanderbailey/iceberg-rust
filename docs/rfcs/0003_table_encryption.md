@@ -35,8 +35,8 @@ production-tested. It defines:
 
 - **`EncryptionManager`** -- orchestrates encrypt/decrypt of `InputFile`/`OutputFile`
 - **`KeyManagementClient`** -- pluggable KMS integration (wrap/unwrap keys)
-- **`EncryptedInputFile` / `EncryptedOutputFile`** -- thin wrappers pairing a raw file handle
-  with its `EncryptionKeyMetadata`
+- **`EncryptedInputFile` / `NativeEncryptedInputFile` / `EncryptedOutputFile` / `NativeEncryptedOutputFile`** --
+  thin wrappers pairing a raw file handle with its encryption key material
 - **`StandardEncryptionManager`** -- envelope encryption with key caching, AGS1 streams,
   and Parquet native encryption support
 - **`StandardKeyMetadata`** -- Avro-serialized key metadata (wrapped DEK, AAD prefix, file length)
@@ -181,9 +181,9 @@ FileScanTask
           │
   ArrowReader::create_parquet_record_batch_stream_builder_with_key_metadata()
     1. If key_metadata present:
-       a. file_io.new_native_encrypted_input(path, key_metadata) → NativeEncrypted InputFile
-       b. Parse StandardKeyMetadata → extract plaintext DEK + AAD prefix
-       c. Build FileDecryptionProperties from NativeKeyMaterial (DEK + AAD prefix)
+       a. file_io.new_native_encrypted_input(path, key_metadata) → NativeEncryptedInputFile
+       b. Extract NativeKeyMaterial (plaintext DEK + AAD prefix)
+       c. Build FileDecryptionProperties from NativeKeyMaterial
        d. Pass to ParquetRecordBatchStreamBuilder
     2. If not: standard Parquet read
 ```
@@ -193,12 +193,12 @@ FileScanTask
 ```
 RollingFileWriter::new_output_file()
     1. If file_io.encryption_manager() is Some:
-       a. file_io.new_native_encrypted_output(path) → EncryptedOutputFile
+       a. file_io.new_native_encrypted_output(path) → NativeEncryptedOutputFile
        b. EncryptionManager generates random plaintext DEK + AAD prefix
-       c. OutputFile::NativeEncrypted carries NativeKeyMaterial for Parquet writer
+       c. NativeEncryptedOutputFile carries NativeKeyMaterial for Parquet writer
        d. Store plaintext StandardKeyMetadata as key_metadata bytes on DataFile
           (protected by being stored inside the encrypted parent manifest)
-    2. ParquetWriter detects NativeEncrypted, configures FileEncryptionProperties
+    2. ParquetWriter extracts NativeKeyMaterial, configures FileEncryptionProperties
 
 SnapshotProducer::commit()
     1. Manifest writing:
@@ -233,7 +233,7 @@ crates/iceberg/src/
 │   ├── encryption_manager.rs        # EncryptionManager (concrete struct)
 │   ├── file_encryptor.rs            # FileEncryptor (write-side AGS1 wrapper)
 │   ├── file_decryptor.rs            # FileDecryptor (read-side AGS1 wrapper)
-│   ├── encrypted_io.rs              # EncryptedInputFile / EncryptedOutputFile wrappers
+│   ├── encrypted_io.rs              # Encrypted / NativeEncrypted InputFile / OutputFile structs
 │   ├── stream.rs                    # AesGcmFileRead / AesGcmFileWrite (AGS1 format)
 │   ├── kms/
 │   │   ├── mod.rs                   # KmsClientFactory trait
@@ -386,13 +386,16 @@ impl EncryptionManager {
     pub fn new(kms_client: Arc<dyn KeyManagementClient>) -> Self;
 
     /// Decrypt an AGS1 stream-encrypted file.
-    pub async fn decrypt(&self, encrypted: EncryptedInputFile) -> Result<InputFile>;
+    pub async fn decrypt(&self, input: InputFile, key_metadata: &[u8]) -> Result<EncryptedInputFile>;
 
     /// Encrypt a file with AGS1 stream encryption.
     pub async fn encrypt(&self, raw_output: OutputFile) -> Result<EncryptedOutputFile>;
 
     /// Encrypt for Parquet Modular Encryption (generates NativeKeyMaterial).
-    pub async fn encrypt_native(&self, raw_output: OutputFile) -> Result<EncryptedOutputFile>;
+    pub async fn encrypt_native(&self, raw_output: OutputFile) -> Result<NativeEncryptedOutputFile>;
+
+    /// Decrypt key metadata for a Parquet Modular Encryption (PME) file.
+    pub fn decrypt_native(&self, raw_input: InputFile, key_metadata: &[u8]) -> Result<NativeEncryptedInputFile>;
 
     /// Unwrap key metadata for a manifest list.
     /// 1. Look up the manifest list's EncryptedKey by key ID
@@ -455,56 +458,61 @@ block to its position in the stream to prevent reordering attacks.
 random-access reads. **`AesGcmFileWrite`** implements `FileWrite` for transparent AGS1
 encryption with block buffering.
 
-### EncryptedInputFile and EncryptedOutputFile Wrappers
+### Encrypted File Wrappers
 
 Rather than adding encryption variants to `InputFile`/`OutputFile` (which would change the
-public API of those core types), encryption uses dedicated wrapper types. `EncryptedInputFile`
-and `EncryptedOutputFile` wrap a plain `InputFile`/`OutputFile` and add transparent
-encryption/decryption. The plain `InputFile`/`OutputFile` types remain unchanged.
+public API of those core types), encryption uses dedicated wrapper structs. These wrap a
+plain `InputFile`/`OutputFile` and add encryption/decryption capabilities. The plain
+`InputFile`/`OutputFile` types remain unchanged.
+
+AGS1 stream encryption and Parquet Modular Encryption (PME) are separate structs rather
+than enum variants because they are used in entirely different code paths — AGS1 for
+manifests and manifest lists, PME for data files. Separate types give compile-time safety:
+a function handling PME takes `NativeEncryptedInputFile` and cannot accidentally receive
+an AGS1 file.
 
 ```rust
-/// Wraps a plain InputFile with decryption capabilities.
-pub enum EncryptedInputFile {
-    /// AGS1 stream-encrypted file. Decrypted transparently on read.
-    Encrypted {
-        inner: InputFile,
-        decryptor: Arc<AesGcmFileDecryptor>,
-    },
-    /// Parquet Modular Encryption. The Parquet reader handles decryption.
-    NativeEncrypted {
-        inner: InputFile,
-        key_material: NativeKeyMaterial,
-    },
+/// AGS1 stream-encrypted input file. Decrypted transparently on read.
+pub struct EncryptedInputFile {
+    inner: InputFile,
+    decryptor: Arc<AesGcmFileDecryptor>,
 }
 
-/// Wraps a plain OutputFile with encryption capabilities.
-pub enum EncryptedOutputFile {
-    /// AGS1 stream-encrypted output. Encrypted transparently on write.
-    Encrypted {
-        inner: OutputFile,
-        key_metadata: Box<[u8]>,
-        encryptor: Arc<AesGcmFileEncryptor>,
-    },
-    /// Parquet Modular Encryption. The Parquet writer handles encryption.
-    NativeEncrypted {
-        inner: OutputFile,
-        key_metadata: Box<[u8]>,
-        key_material: NativeKeyMaterial,
-    },
+/// Parquet Modular Encryption input file.
+/// The Parquet reader handles decryption at the column/page level.
+pub struct NativeEncryptedInputFile {
+    inner: InputFile,
+    key_material: NativeKeyMaterial,
+}
+
+/// AGS1 stream-encrypted output file. Encrypted transparently on write.
+pub struct EncryptedOutputFile {
+    inner: OutputFile,
+    key_metadata: Box<[u8]>,
+    encryptor: Arc<AesGcmFileEncryptor>,
+}
+
+/// Parquet Modular Encryption output file.
+/// The Parquet writer handles encryption at the column/page level.
+pub struct NativeEncryptedOutputFile {
+    inner: OutputFile,
+    key_metadata: Box<[u8]>,
+    key_material: NativeKeyMaterial,
 }
 ```
 
-Both wrappers delegate standard operations (`location()`, `exists()`, `read()`, `reader()`,
-`write()`, `writer()`) to the inner file, with `Encrypted` variants transparently
-encrypting/decrypting via `AesGcmFileRead`/`AesGcmFileWrite`. `into_inner()` recovers
-the underlying plain file.
+`EncryptedInputFile` and `EncryptedOutputFile` delegate standard operations (`location()`,
+`read()`, `reader()`, `writer()`) to the inner file, transparently encrypting/decrypting
+via `AesGcmFileRead`/`AesGcmFileWrite`. `NativeEncryptedInputFile` and
+`NativeEncryptedOutputFile` carry `NativeKeyMaterial` (plaintext DEK and AAD prefix)
+for the Parquet reader/writer to configure `FileDecryptionProperties` /
+`FileEncryptionProperties`. All four types provide `into_inner()` to recover the
+underlying plain file.
 
-`NativeKeyMaterial` carries the plaintext DEK and AAD prefix for Parquet's
-`FileEncryptionProperties` / `FileDecryptionProperties`.
-
-This wrapper approach means `ManifestReader` and `ManifestListWriter` accept the encrypted
-wrapper types (or `Box<dyn FileWrite>`) where encryption is needed, rather than requiring
-changes to the `InputFile`/`OutputFile` enums themselves.
+This wrapper approach means `ManifestReader` and `ManifestListWriter` accept the AGS1
+wrapper types (or `Box<dyn FileWrite>`) where encryption is needed, while the Parquet
+writer accepts `NativeEncryptedOutputFile`, rather than requiring changes to the
+`InputFile`/`OutputFile` types themselves.
 
 ### FileIO Integration
 
@@ -520,20 +528,20 @@ let file_io = file_io.with_encryption_manager(Arc::new(encryption_manager));
 
 FileIO provides encryption-aware factory methods:
 
-| Method | Purpose |
-|--------|---------|
-| `new_encrypted_input(path, key_metadata)` | AGS1 stream decryption (manifests, manifest lists) |
-| `new_encrypted_output(path)` | AGS1 stream encryption |
-| `new_native_encrypted_input(path, key_metadata)` | PME input (Parquet handles decryption) |
-| `new_native_encrypted_output(path)` | PME output (Parquet handles encryption) |
-| `encryption_manager()` | Returns the configured EncryptionManager, if any |
+| Method | Returns | Purpose |
+|--------|---------|---------|
+| `new_encrypted_input(path, key_metadata)` | `EncryptedInputFile` | AGS1 stream decryption (manifests, manifest lists) |
+| `new_encrypted_output(path)` | `EncryptedOutputFile` | AGS1 stream encryption |
+| `new_native_encrypted_input(path, key_metadata)` | `NativeEncryptedInputFile` | PME input (Parquet handles decryption) |
+| `new_native_encrypted_output(path)` | `NativeEncryptedOutputFile` | PME output (Parquet handles encryption) |
+| `encryption_manager()` | `Option<Arc<EncryptionManager>>` | Returns the configured EncryptionManager, if any |
 
 #### After Storage Trait RFC
 
 RFC 0002 removes `Extensions` from `FileIOBuilder`. The `KmsClientFactory` will be
 provided at the catalog level (Option A), which is consistent with the wrapper approach
-for `EncryptedInputFile`/`EncryptedOutputFile` — encryption operates at the `FileIO` level
-rather than wrapping storage:
+for the encrypted file wrappers — encryption operates at the `FileIO` level rather than
+wrapping storage:
 
 ```rust
 let catalog = GlueCatalogBuilder::default()
@@ -551,14 +559,14 @@ by the storage trait changes.
 For Parquet data files, encryption is handled natively by the Parquet reader/writer using
 `FileEncryptionProperties` and `FileDecryptionProperties` from `parquet-rs`.
 
-**Write path** (`ParquetWriter`): When the output file is `NativeEncrypted`, the writer extracts
+**Write path** (`ParquetWriter`): When given a `NativeEncryptedOutputFile`, the writer extracts
 `NativeKeyMaterial` (plaintext DEK + AAD prefix) and configures `FileEncryptionProperties` on the
 `AsyncArrowWriter`. The Parquet crate handles column/page-level encryption.
 
 **Read path** (`ArrowReader`): When `FileScanTask.key_metadata` is present, the reader calls
-`file_io.new_native_encrypted_input()` which deserializes `StandardKeyMetadata` to extract the
-plaintext DEK and AAD prefix. These are used to build `FileDecryptionProperties` which are
-passed to `ParquetRecordBatchStreamBuilder::new_with_options()`.
+`file_io.new_native_encrypted_input()` which returns a `NativeEncryptedInputFile`. The reader
+extracts `NativeKeyMaterial` to build `FileDecryptionProperties` which are passed to
+`ParquetRecordBatchStreamBuilder::new_with_options()`.
 
 The `ArrowFileReader::get_metadata()` implementation forwards both `file_decryption_properties`
 and `metadata_options` from `ArrowReaderOptions` to `ParquetMetaDataReader`, enabling encrypted
