@@ -20,8 +20,12 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::vec;
 
-use datafusion::arrow::array::RecordBatch;
-use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use datafusion::arrow::array::{
+    ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray,
+};
+use datafusion::arrow::datatypes::{
+    DataType, Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
+};
 use datafusion::error::Result as DFResult;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
@@ -29,8 +33,10 @@ use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProperties};
 use datafusion::prelude::Expr;
-use futures::{Stream, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
+use iceberg::arrow::ArrowReaderBuilder;
 use iceberg::expr::Predicate;
+use iceberg::scan::{ChangelogOperation, ChangelogScanTask, FileScanTask};
 use iceberg::table::Table;
 
 use super::expr_to_predicate::convert_filters_to_predicate;
@@ -45,6 +51,13 @@ pub(crate) enum ScanRange {
     PointInTime(i64),
     /// Incremental append scan between two snapshots.
     Incremental {
+        from: i64,
+        to: Option<i64>,
+        from_inclusive: bool,
+    },
+    /// Changelog scan between two snapshots.
+    /// Returns data with extra columns: `_change_type`, `_change_ordinal`, `_commit_snapshot_id`.
+    Changelog {
         from: i64,
         to: Option<i64>,
         from_inclusive: bool,
@@ -222,7 +235,7 @@ impl DisplayAs for IcebergTableScan {
 /// This function initializes a [`TableScan`], builds it,
 /// and then converts it into a stream of Arrow [`RecordBatch`]es.
 ///
-/// Supports both regular point-in-time scans and incremental scans.
+/// Supports regular scans, incremental scans, and changelog scans.
 async fn get_batch_stream(
     table: Table,
     scan_range: ScanRange,
@@ -244,6 +257,18 @@ async fn get_batch_stream(
         }};
     }
 
+    // Changelog scans use a different path — they produce ChangelogScanTasks
+    // that need metadata columns appended.
+    if let ScanRange::Changelog {
+        from,
+        to,
+        from_inclusive,
+    } = scan_range
+    {
+        return get_changelog_batch_stream(table, from, to, from_inclusive, column_names, predicates)
+            .await;
+    }
+
     let table_scan = match scan_range {
         ScanRange::Incremental {
             from,
@@ -261,6 +286,7 @@ async fn get_batch_stream(
         ScanRange::PointInTime(snapshot_id) => {
             configure_and_build!(table.scan().snapshot_id(snapshot_id))
         }
+        ScanRange::Changelog { .. } => unreachable!(),
     };
 
     let stream = table_scan
@@ -269,6 +295,179 @@ async fn get_batch_stream(
         .map_err(to_datafusion_error)?
         .map_err(to_datafusion_error);
     Ok(Box::pin(stream))
+}
+
+/// Reads changelog tasks and appends metadata columns to each batch.
+async fn get_changelog_batch_stream(
+    table: Table,
+    from: i64,
+    to: Option<i64>,
+    from_inclusive: bool,
+    column_names: Option<Vec<String>>,
+    predicates: Option<Predicate>,
+) -> DFResult<Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>> {
+    let mut builder = if from_inclusive {
+        table.incremental_changelog_scan_inclusive(from, to)
+    } else {
+        table.incremental_changelog_scan(from, to)
+    };
+
+    // Filter out changelog metadata columns — they don't exist in the table schema
+    // and are appended after reading the data files.
+    let changelog_meta_cols = ["_change_type", "_change_ordinal", "_commit_snapshot_id"];
+    builder = match column_names {
+        Some(names) => {
+            let data_names: Vec<String> = names
+                .into_iter()
+                .filter(|n| !changelog_meta_cols.contains(&n.as_str()))
+                .collect();
+            if data_names.is_empty() {
+                builder.select_empty()
+            } else {
+                builder.select(data_names)
+            }
+        }
+        None => builder.select_all(),
+    };
+
+    if let Some(pred) = predicates {
+        builder = builder.with_filter(pred);
+    }
+
+    let changelog_scan = builder.build().map_err(to_datafusion_error)?;
+
+    let tasks: Vec<ChangelogScanTask> = changelog_scan
+        .plan_files()
+        .await
+        .map_err(to_datafusion_error)?
+        .try_collect()
+        .await
+        .map_err(to_datafusion_error)?;
+
+    let file_io = table.file_io().clone();
+
+    // Process each task: read its data file, then append metadata columns.
+    let stream = futures::stream::iter(tasks)
+        .then(move |task| {
+            let file_io = file_io.clone();
+            async move {
+                let operation = task.operation;
+                let change_ordinal = task.change_ordinal;
+                let commit_snapshot_id = task.commit_snapshot_id;
+
+                // Convert to FileScanTask for reading.
+                let file_scan_task = changelog_task_to_file_scan_task(task);
+                let task_stream = Box::pin(futures::stream::once(async { Ok(file_scan_task) }));
+
+                let reader = ArrowReaderBuilder::new(file_io)
+                    .build()
+                    .read(task_stream)
+                    .map_err(to_datafusion_error)?;
+
+                // Append metadata columns to each batch from this task.
+                let batches: Vec<RecordBatch> = reader
+                    .map_err(to_datafusion_error)
+                    .and_then(move |batch| {
+                        futures::future::ready(append_changelog_columns(
+                            batch,
+                            operation,
+                            change_ordinal,
+                            commit_snapshot_id,
+                        ))
+                    })
+                    .try_collect()
+                    .await?;
+
+                Ok::<_, datafusion::error::DataFusionError>(futures::stream::iter(
+                    batches.into_iter().map(Ok),
+                ))
+            }
+        })
+        .try_flatten();
+
+    Ok(Box::pin(stream))
+}
+
+fn changelog_task_to_file_scan_task(task: ChangelogScanTask) -> FileScanTask {
+    FileScanTask {
+        data_file_path: task.data_file_path,
+        data_file_format: task.data_file_format,
+        file_size_in_bytes: task.file_size_in_bytes,
+        start: task.start,
+        length: task.length,
+        record_count: task.record_count,
+        schema: task.schema,
+        project_field_ids: task.project_field_ids,
+        predicate: task.predicate,
+        deletes: vec![],
+        partition: task.partition,
+        partition_spec: task.partition_spec,
+        name_mapping: None,
+        case_sensitive: true,
+    }
+}
+
+fn append_changelog_columns(
+    batch: RecordBatch,
+    operation: ChangelogOperation,
+    change_ordinal: i32,
+    commit_snapshot_id: i64,
+) -> DFResult<RecordBatch> {
+    let num_rows = batch.num_rows();
+
+    let change_type_value = match operation {
+        ChangelogOperation::Insert => "INSERT",
+        ChangelogOperation::Delete => "DELETE",
+    };
+
+    let change_type_col: ArrayRef =
+        Arc::new(StringArray::from(vec![change_type_value; num_rows]));
+    let change_ordinal_col: ArrayRef =
+        Arc::new(Int32Array::from(vec![change_ordinal; num_rows]));
+    let commit_snapshot_col: ArrayRef =
+        Arc::new(Int64Array::from(vec![commit_snapshot_id; num_rows]));
+
+    let mut fields = batch.schema().fields().to_vec();
+    fields.push(Arc::new(Field::new("_change_type", DataType::Utf8, false)));
+    fields.push(Arc::new(Field::new(
+        "_change_ordinal",
+        DataType::Int32,
+        false,
+    )));
+    fields.push(Arc::new(Field::new(
+        "_commit_snapshot_id",
+        DataType::Int64,
+        false,
+    )));
+
+    let new_schema = Arc::new(ArrowSchema::new(fields));
+
+    let mut columns = batch.columns().to_vec();
+    columns.push(change_type_col);
+    columns.push(change_ordinal_col);
+    columns.push(commit_snapshot_col);
+
+    RecordBatch::try_new(new_schema, columns).map_err(|e| {
+        datafusion::error::DataFusionError::ArrowError(Box::new(e), None)
+    })
+}
+
+/// Returns the Arrow schema for a changelog scan: the base table schema
+/// plus `_change_type`, `_change_ordinal`, and `_commit_snapshot_id`.
+pub(crate) fn changelog_schema(base_schema: &ArrowSchemaRef) -> ArrowSchemaRef {
+    let mut fields = base_schema.fields().to_vec();
+    fields.push(Arc::new(Field::new("_change_type", DataType::Utf8, false)));
+    fields.push(Arc::new(Field::new(
+        "_change_ordinal",
+        DataType::Int32,
+        false,
+    )));
+    fields.push(Arc::new(Field::new(
+        "_commit_snapshot_id",
+        DataType::Int64,
+        false,
+    )));
+    Arc::new(ArrowSchema::new(fields))
 }
 
 fn get_column_names(

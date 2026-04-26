@@ -23,7 +23,9 @@ use crate::arrow::ArrowReaderBuilder;
 use crate::inspect::MetadataTable;
 use crate::io::FileIO;
 use crate::io::object_cache::ObjectCache;
-use crate::scan::{IncrementalAppendScanBuilder, TableScanBuilder};
+use crate::scan::{
+    IncrementalAppendScanBuilder, IncrementalChangelogScanBuilder, TableScanBuilder,
+};
 use crate::spec::{SchemaRef, TableMetadata, TableMetadataRef};
 use crate::{Error, ErrorKind, Result, TableIdent};
 
@@ -248,6 +250,32 @@ impl Table {
         IncrementalAppendScanBuilder::new(self, from_snapshot_id, to_snapshot_id, true)
     }
 
+    /// Creates a changelog scan starting after the given snapshot (exclusive).
+    ///
+    /// Returns data files added or removed in APPEND, DELETE, and OVERWRITE
+    /// snapshots after `from_snapshot_id`, up to `to_snapshot_id` or the
+    /// current snapshot if `None`. REPLACE snapshots are excluded.
+    pub fn incremental_changelog_scan(
+        &self,
+        from_snapshot_id: i64,
+        to_snapshot_id: Option<i64>,
+    ) -> IncrementalChangelogScanBuilder<'_> {
+        IncrementalChangelogScanBuilder::new(self, from_snapshot_id, to_snapshot_id, false)
+    }
+
+    /// Creates a changelog scan starting from the given snapshot (inclusive).
+    ///
+    /// Returns data files added or removed in APPEND, DELETE, and OVERWRITE
+    /// snapshots from `from_snapshot_id` (inclusive), up to `to_snapshot_id`
+    /// or the current snapshot if `None`. REPLACE snapshots are excluded.
+    pub fn incremental_changelog_scan_inclusive(
+        &self,
+        from_snapshot_id: i64,
+        to_snapshot_id: Option<i64>,
+    ) -> IncrementalChangelogScanBuilder<'_> {
+        IncrementalChangelogScanBuilder::new(self, from_snapshot_id, to_snapshot_id, true)
+    }
+
     /// Creates a metadata table which provides table-like APIs for inspecting metadata.
     /// See [`MetadataTable`] for more details.
     pub fn inspect(&self) -> MetadataTable<'_> {
@@ -354,6 +382,26 @@ impl StaticTable {
     ) -> IncrementalAppendScanBuilder<'_> {
         self.0
             .incremental_append_scan_inclusive(from_snapshot_id, to_snapshot_id)
+    }
+
+    /// Creates a changelog scan starting after the given snapshot (exclusive).
+    pub fn incremental_changelog_scan(
+        &self,
+        from_snapshot_id: i64,
+        to_snapshot_id: Option<i64>,
+    ) -> IncrementalChangelogScanBuilder<'_> {
+        self.0
+            .incremental_changelog_scan(from_snapshot_id, to_snapshot_id)
+    }
+
+    /// Creates a changelog scan starting from the given snapshot (inclusive).
+    pub fn incremental_changelog_scan_inclusive(
+        &self,
+        from_snapshot_id: i64,
+        to_snapshot_id: Option<i64>,
+    ) -> IncrementalChangelogScanBuilder<'_> {
+        self.0
+            .incremental_changelog_scan_inclusive(from_snapshot_id, to_snapshot_id)
     }
 
     /// Get TableMetadataRef for the static table

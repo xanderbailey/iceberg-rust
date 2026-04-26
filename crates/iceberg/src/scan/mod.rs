@@ -19,6 +19,7 @@
 
 mod cache;
 use cache::*;
+pub(crate) mod changelog;
 mod context;
 use context::*;
 mod incremental;
@@ -30,7 +31,8 @@ use arrow_array::RecordBatch;
 use futures::channel::mpsc::{Sender, channel};
 use futures::stream::BoxStream;
 use futures::{SinkExt, StreamExt, TryStreamExt};
-pub use incremental::IncrementalAppendScanBuilder;
+pub use changelog::ChangelogScan;
+pub use incremental::{IncrementalAppendScanBuilder, IncrementalChangelogScanBuilder};
 pub use task::*;
 
 use crate::arrow::ArrowReaderBuilder;

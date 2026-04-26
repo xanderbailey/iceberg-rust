@@ -53,7 +53,7 @@ use crate::error::to_datafusion_error;
 use crate::physical_plan::commit::IcebergCommitExec;
 use crate::physical_plan::project::project_with_partition;
 use crate::physical_plan::repartition::repartition;
-use crate::physical_plan::scan::{IcebergTableScan, ScanRange};
+use crate::physical_plan::scan::{IcebergTableScan, ScanRange, changelog_schema};
 use crate::physical_plan::sort::sort_by_partition;
 use crate::physical_plan::write::IcebergWriteExec;
 
@@ -370,6 +370,81 @@ impl IcebergStaticTableProvider {
             table,
             schema,
             scan_range: ScanRange::Incremental {
+                from: from_snapshot_id,
+                to: Some(to_snapshot_id),
+                from_inclusive: true,
+            },
+        })
+    }
+
+    /// Creates a provider for changelog scanning between two snapshots.
+    ///
+    /// Returns data files that were added or removed in APPEND, DELETE, and
+    /// OVERWRITE snapshots between `from_snapshot_id` (exclusive) and
+    /// `to_snapshot_id` (inclusive). REPLACE snapshots are excluded.
+    ///
+    /// The output schema includes the base table columns plus three metadata
+    /// columns: `_change_type` (Utf8), `_change_ordinal` (Int32),
+    /// `_commit_snapshot_id` (Int64).
+    pub async fn try_new_changelog(
+        table: Table,
+        from_snapshot_id: i64,
+        to_snapshot_id: i64,
+    ) -> Result<Self> {
+        let snapshot = table
+            .metadata()
+            .snapshot_by_id(to_snapshot_id)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "to_snapshot id {to_snapshot_id} not found in table {}",
+                        table.identifier().name()
+                    ),
+                )
+            })?;
+        let table_schema = snapshot.schema(table.metadata())?;
+        let base_schema = Arc::new(schema_to_arrow_schema(&table_schema)?);
+        let schema = changelog_schema(&base_schema);
+        Ok(IcebergStaticTableProvider {
+            table,
+            schema,
+            scan_range: ScanRange::Changelog {
+                from: from_snapshot_id,
+                to: Some(to_snapshot_id),
+                from_inclusive: false,
+            },
+        })
+    }
+
+    /// Creates a provider for changelog scanning between two snapshots (inclusive).
+    ///
+    /// Same as [`try_new_changelog`](Self::try_new_changelog) but includes data
+    /// from `from_snapshot_id` itself.
+    pub async fn try_new_changelog_inclusive(
+        table: Table,
+        from_snapshot_id: i64,
+        to_snapshot_id: i64,
+    ) -> Result<Self> {
+        let snapshot = table
+            .metadata()
+            .snapshot_by_id(to_snapshot_id)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "to_snapshot id {to_snapshot_id} not found in table {}",
+                        table.identifier().name()
+                    ),
+                )
+            })?;
+        let table_schema = snapshot.schema(table.metadata())?;
+        let base_schema = Arc::new(schema_to_arrow_schema(&table_schema)?);
+        let schema = changelog_schema(&base_schema);
+        Ok(IcebergStaticTableProvider {
+            table,
+            schema,
+            scan_range: ScanRange::Changelog {
                 from: from_snapshot_id,
                 to: Some(to_snapshot_id),
                 from_inclusive: true,

@@ -15,12 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Incremental append scan for reading only newly added data between snapshots.
+//! Incremental scans for reading changes between snapshots.
+//!
+//! Provides two scan types:
+//! - [`IncrementalAppendScanBuilder`]: returns only newly added data files from APPEND snapshots.
+//! - [`IncrementalChangelogScanBuilder`]: returns inserted and deleted data files across
+//!   APPEND, DELETE, and OVERWRITE snapshots (excludes REPLACE).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::expr::Predicate;
+use crate::scan::changelog::ChangelogScan;
 use crate::scan::context::{ManifestEntryFilter, ManifestFileFilter};
 use crate::scan::{ScanConfig, TableScan, build_table_scan};
 use crate::spec::{ManifestContentType, ManifestStatus, Operation, TableMetadataRef};
@@ -334,6 +340,281 @@ impl<'a> IncrementalAppendScanBuilder<'a> {
             Some(append_set.manifest_file_filter()),
             Some(append_set.manifest_entry_filter()),
         )
+    }
+}
+
+/// Represents a validated range of snapshots for changelog scanning.
+///
+/// Unlike [`AppendSnapshotSet`], this includes APPEND, DELETE, and OVERWRITE
+/// operations — only REPLACE (compaction/rewrite) is excluded. Snapshots are
+/// tracked in oldest-first order to assign sequential change ordinals.
+#[derive(Debug, Clone)]
+pub(crate) struct ChangelogSnapshotSet {
+    snapshot_ids: HashSet<i64>,
+    ordinal_map: HashMap<i64, i32>,
+}
+
+impl ChangelogSnapshotSet {
+    /// Build a changelog snapshot set by walking the ancestry chain.
+    ///
+    /// Validates that `from_snapshot_id` is an ancestor of `to_snapshot_id`
+    /// and collects all non-REPLACE snapshot IDs in between, assigning
+    /// ordinals in oldest-first order.
+    pub(crate) fn build(
+        table_metadata: &TableMetadataRef,
+        from_snapshot_id: i64,
+        to_snapshot_id: i64,
+        from_inclusive: bool,
+    ) -> Result<Self> {
+        // Same ancestry validation as AppendSnapshotSet.
+        let oldest_exclusive = if from_inclusive {
+            let from_snapshot =
+                table_metadata
+                    .snapshot_by_id(from_snapshot_id)
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            format!("Snapshot {from_snapshot_id} not found"),
+                        )
+                    })?;
+            from_snapshot.parent_snapshot_id()
+        } else {
+            Some(from_snapshot_id)
+        };
+
+        let snapshots: Vec<_> =
+            ancestors_between(table_metadata, to_snapshot_id, oldest_exclusive).collect();
+
+        if from_snapshot_id == to_snapshot_id {
+            if !from_inclusive {
+                return Ok(Self {
+                    snapshot_ids: HashSet::new(),
+                    ordinal_map: HashMap::new(),
+                });
+            }
+        } else if snapshots.is_empty() {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "from_snapshot {from_snapshot_id} is not an ancestor of to_snapshot {to_snapshot_id}",
+                ),
+            ));
+        } else {
+            let oldest_collected = snapshots.last().unwrap();
+            let connects = if from_inclusive {
+                oldest_collected.snapshot_id() == from_snapshot_id
+            } else {
+                oldest_collected.parent_snapshot_id() == Some(from_snapshot_id)
+            };
+            if !connects {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "from_snapshot {from_snapshot_id} is not an ancestor of to_snapshot {to_snapshot_id}",
+                    ),
+                ));
+            }
+        }
+
+        // Collect non-REPLACE snapshots in oldest-first order, assigning ordinals.
+        let mut snapshot_ids = HashSet::new();
+        let mut ordinal_map = HashMap::new();
+        let mut ordinal = 0i32;
+
+        for snapshot in snapshots.iter().rev() {
+            if snapshot.summary().operation != Operation::Replace {
+                snapshot_ids.insert(snapshot.snapshot_id());
+                ordinal_map.insert(snapshot.snapshot_id(), ordinal);
+                ordinal += 1;
+            }
+        }
+
+        Ok(Self {
+            snapshot_ids,
+            ordinal_map,
+        })
+    }
+
+    /// Check if a snapshot_id is within this set.
+    pub(crate) fn contains(&self, snapshot_id: i64) -> bool {
+        self.snapshot_ids.contains(&snapshot_id)
+    }
+
+    /// Returns the change ordinal for the given snapshot ID.
+    pub(crate) fn ordinal_for(&self, snapshot_id: i64) -> i32 {
+        self.ordinal_map[&snapshot_id]
+    }
+
+    /// Create a manifest file filter that skips delete manifests and
+    /// data manifests whose `added_snapshot_id` is outside this set.
+    pub(crate) fn manifest_file_filter(self: &Arc<Self>) -> ManifestFileFilter {
+        let set = self.clone();
+        Arc::new(move |manifest_file| {
+            manifest_file.content != ManifestContentType::Deletes
+                && set.contains(manifest_file.added_snapshot_id)
+        })
+    }
+
+    /// Create a manifest entry filter that includes only entries with
+    /// status ADDED or DELETED (not EXISTING) and a snapshot_id within
+    /// this set.
+    pub(crate) fn manifest_entry_filter(self: &Arc<Self>) -> ManifestEntryFilter {
+        let set = self.clone();
+        Arc::new(move |entry| {
+            entry.status() != ManifestStatus::Existing
+                && entry.snapshot_id().is_some_and(|id| set.contains(id))
+        })
+    }
+}
+
+/// Builder to create an incremental changelog scan between two snapshots.
+///
+/// A changelog scan returns data files that were added or removed in
+/// snapshots between `from_snapshot_id` and the target snapshot. REPLACE
+/// (compaction) snapshots are excluded. Delete manifests are not yet supported
+/// and will produce an error at plan time.
+///
+/// Each returned [`ChangelogScanTask`](crate::scan::ChangelogScanTask) carries
+/// an [`operation`](crate::scan::ChangelogOperation) (Insert or Delete),
+/// a `change_ordinal` for ordering, and the `commit_snapshot_id`.
+///
+/// Use [`Table::incremental_changelog_scan`] or
+/// [`Table::incremental_changelog_scan_inclusive`] to create an instance.
+pub struct IncrementalChangelogScanBuilder<'a> {
+    table: &'a Table,
+    from_snapshot_id: i64,
+    from_inclusive: bool,
+    to_snapshot_id: Option<i64>,
+    column_names: Option<Vec<String>>,
+    case_sensitive: bool,
+    filter: Option<Predicate>,
+    concurrency_limit_manifest_entries: usize,
+    concurrency_limit_manifest_files: usize,
+}
+
+impl<'a> IncrementalChangelogScanBuilder<'a> {
+    pub(crate) fn new(
+        table: &'a Table,
+        from_snapshot_id: i64,
+        to_snapshot_id: Option<i64>,
+        from_inclusive: bool,
+    ) -> Self {
+        let num_cpus = available_parallelism().get();
+
+        Self {
+            table,
+            from_snapshot_id,
+            from_inclusive,
+            to_snapshot_id,
+            column_names: None,
+            case_sensitive: true,
+            filter: None,
+            concurrency_limit_manifest_entries: num_cpus,
+            concurrency_limit_manifest_files: num_cpus,
+        }
+    }
+
+    /// Sets the scan's case sensitivity.
+    pub fn with_case_sensitive(mut self, case_sensitive: bool) -> Self {
+        self.case_sensitive = case_sensitive;
+        self
+    }
+
+    /// Specifies a predicate to use as a filter.
+    pub fn with_filter(mut self, predicate: Predicate) -> Self {
+        self.filter = Some(predicate.rewrite_not());
+        self
+    }
+
+    /// Select all columns.
+    pub fn select_all(mut self) -> Self {
+        self.column_names = None;
+        self
+    }
+
+    /// Select empty columns.
+    pub fn select_empty(mut self) -> Self {
+        self.column_names = Some(vec![]);
+        self
+    }
+
+    /// Select some columns of the table.
+    pub fn select(mut self, column_names: impl IntoIterator<Item = impl ToString>) -> Self {
+        self.column_names = Some(
+            column_names
+                .into_iter()
+                .map(|item| item.to_string())
+                .collect(),
+        );
+        self
+    }
+
+    /// Sets the concurrency limit for both manifest files and manifest
+    /// entries for this scan.
+    pub fn with_concurrency_limit(mut self, limit: usize) -> Self {
+        self.concurrency_limit_manifest_files = limit;
+        self.concurrency_limit_manifest_entries = limit;
+        self
+    }
+
+    /// Build the incremental changelog scan.
+    pub fn build(self) -> Result<ChangelogScan> {
+        let to_snapshot = match self.to_snapshot_id {
+            Some(snapshot_id) => self
+                .table
+                .metadata()
+                .snapshot_by_id(snapshot_id)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("to_snapshot with id {snapshot_id} not found"),
+                    )
+                })?
+                .clone(),
+            None => {
+                let Some(current_snapshot) = self.table.metadata().current_snapshot() else {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        "Cannot perform changelog scan: table has no snapshots",
+                    ));
+                };
+                current_snapshot.clone()
+            }
+        };
+
+        let changelog_set = Arc::new(ChangelogSnapshotSet::build(
+            &self.table.metadata_ref(),
+            self.from_snapshot_id,
+            to_snapshot.snapshot_id(),
+            self.from_inclusive,
+        )?);
+
+        // Reuse build_table_scan for schema validation and PlanContext construction,
+        // then move the PlanContext into ChangelogScan.
+        let table_scan = build_table_scan(
+            ScanConfig {
+                table: self.table,
+                column_names: self.column_names,
+                batch_size: None,
+                case_sensitive: self.case_sensitive,
+                filter: self.filter,
+                concurrency_limit_data_files: 0, // unused by changelog scan
+                concurrency_limit_manifest_entries: self.concurrency_limit_manifest_entries,
+                concurrency_limit_manifest_files: self.concurrency_limit_manifest_files,
+                row_group_filtering_enabled: false,
+                row_selection_enabled: false,
+            },
+            to_snapshot,
+            Some(changelog_set.manifest_file_filter()),
+            Some(changelog_set.manifest_entry_filter()),
+        )?;
+
+        Ok(ChangelogScan {
+            plan_context: table_scan.plan_context,
+            changelog_set,
+            concurrency_limit_manifest_files: self.concurrency_limit_manifest_files,
+            concurrency_limit_manifest_entries: self.concurrency_limit_manifest_entries,
+        })
     }
 }
 

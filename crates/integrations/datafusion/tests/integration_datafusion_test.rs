@@ -35,7 +35,7 @@ use iceberg::test_utils::check_record_batches;
 use iceberg::{
     Catalog, CatalogBuilder, MemoryCatalog, NamespaceIdent, Result, TableCreation, TableIdent,
 };
-use iceberg_datafusion::IcebergCatalogProvider;
+use iceberg_datafusion::{IcebergCatalogProvider, IcebergStaticTableProvider};
 use tempfile::TempDir;
 
 fn temp_path() -> String {
@@ -941,6 +941,118 @@ async fn test_insert_into_partitioned() -> Result<()> {
     assert!(
         file_io.exists(&clothing_path).await?,
         "Expected partition directory: {clothing_path}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_changelog_scan_end_to_end() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_changelog".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    let creation = get_table_creation(temp_path(), "my_table", None)?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Insert first batch of data → snapshot 1
+    ctx.sql("INSERT INTO catalog.test_changelog.my_table VALUES (1, 'alice'), (2, 'bob')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let table_ident = TableIdent::new(namespace.clone(), "my_table".to_string());
+    let table_after_s1 = client.load_table(&table_ident).await?;
+    let snapshot_1_id = table_after_s1
+        .metadata()
+        .current_snapshot()
+        .unwrap()
+        .snapshot_id();
+
+    // Insert second batch → snapshot 2
+    ctx.sql("INSERT INTO catalog.test_changelog.my_table VALUES (3, 'charlie')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let table_after_s2 = client.load_table(&table_ident).await?;
+    let snapshot_2_id = table_after_s2
+        .metadata()
+        .current_snapshot()
+        .unwrap()
+        .snapshot_id();
+
+    // Changelog scan from snapshot 1 (exclusive) to snapshot 2:
+    // should return only the data from snapshot 2 (charlie).
+    let changelog_provider = IcebergStaticTableProvider::try_new_changelog(
+        table_after_s2.clone(),
+        snapshot_1_id,
+        snapshot_2_id,
+    )
+    .await
+    .unwrap();
+
+    ctx.register_table("changelog", Arc::new(changelog_provider))
+        .unwrap();
+
+    let df = ctx.sql("SELECT * FROM changelog").await.unwrap();
+
+    // Verify schema includes metadata columns
+    let schema = df.schema();
+    let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    assert!(
+        field_names.contains(&"_change_type"),
+        "Schema should include _change_type, got: {field_names:?}"
+    );
+    assert!(
+        field_names.contains(&"_change_ordinal"),
+        "Schema should include _change_ordinal"
+    );
+    assert!(
+        field_names.contains(&"_commit_snapshot_id"),
+        "Schema should include _commit_snapshot_id"
+    );
+
+    let batches = df.collect().await.unwrap();
+
+    check_record_batches(
+        batches,
+        expect![[r#"
+            Field { "foo1": Int32, metadata: {"PARQUET:field_id": "1"} },
+            Field { "foo2": Utf8, metadata: {"PARQUET:field_id": "2"} },
+            Field { "_change_type": Utf8 },
+            Field { "_change_ordinal": Int32 },
+            Field { "_commit_snapshot_id": Int64 }"#]],
+        expect![[r#"
+            foo1: PrimitiveArray<Int32>
+            [
+              3,
+            ],
+            foo2: StringArray
+            [
+              "charlie",
+            ],
+            _change_type: StringArray
+            [
+              "INSERT",
+            ],
+            _change_ordinal: PrimitiveArray<Int32>
+            [
+              0,
+            ],
+            _commit_snapshot_id: (skipped)"#]],
+        &["_commit_snapshot_id"],
+        Some("foo1"),
     );
 
     Ok(())

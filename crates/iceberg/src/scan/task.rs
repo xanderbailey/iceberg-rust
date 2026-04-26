@@ -30,6 +30,55 @@ use crate::spec::{
 /// A stream of [`FileScanTask`].
 pub type FileScanTaskStream = BoxStream<'static, Result<FileScanTask>>;
 
+/// A stream of [`ChangelogScanTask`].
+pub type ChangelogScanTaskStream = BoxStream<'static, Result<ChangelogScanTask>>;
+
+/// The type of change operation in a changelog scan task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangelogOperation {
+    /// Rows were inserted (from entries with status ADDED).
+    Insert,
+    /// Rows were deleted (from entries with status DELETED).
+    Delete,
+}
+
+/// A task representing a change detected by a changelog scan.
+///
+/// Each task corresponds to a data file from a snapshot in the changelog range,
+/// annotated with whether the file represents insertions or deletions,
+/// which snapshot produced it, and its ordinal position in the changelog.
+#[derive(Debug, Clone)]
+pub struct ChangelogScanTask {
+    /// The data file path.
+    pub data_file_path: String,
+    /// The format of the data file.
+    pub data_file_format: DataFileFormat,
+    /// Total file size in bytes.
+    pub file_size_in_bytes: u64,
+    /// Start offset to read.
+    pub start: u64,
+    /// Length to read.
+    pub length: u64,
+    /// Number of records, if known.
+    pub record_count: Option<u64>,
+    /// The schema for reading this file.
+    pub schema: SchemaRef,
+    /// Field IDs to project.
+    pub project_field_ids: Vec<i32>,
+    /// Filter predicate, if any.
+    pub predicate: Option<BoundPredicate>,
+    /// Partition values from the manifest entry.
+    pub partition: Option<Struct>,
+    /// Partition spec for this file.
+    pub partition_spec: Option<Arc<PartitionSpec>>,
+    /// Whether this change is an insertion or deletion.
+    pub operation: ChangelogOperation,
+    /// Ordinal position: 0 = oldest snapshot in range, incrementing.
+    pub change_ordinal: i32,
+    /// The snapshot ID that produced this change.
+    pub commit_snapshot_id: i64,
+}
+
 /// Serialization helper that always returns NotImplementedError.
 /// Used for fields that should not be serialized but we want to be explicit about it.
 fn serialize_not_implemented<S, T>(_: &T, _: S) -> std::result::Result<S::Ok, S::Error>
