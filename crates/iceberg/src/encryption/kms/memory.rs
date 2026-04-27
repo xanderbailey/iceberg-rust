@@ -93,8 +93,14 @@ impl MemoryKeyManagementClient {
         key_id: impl Into<String>,
         key_bytes: SensitiveBytes,
     ) -> Result<()> {
-        let _ = SecureKey::new(key_bytes.as_bytes())?;
+        Self::check_key_length(&key_bytes)?;
         self.insert_key(key_id.into(), key_bytes)
+    }
+
+    /// Check the key length is valid by constructing a SecureKey.
+    fn check_key_length(key_bytes: &SensitiveBytes) -> Result<()> {
+        SecureKey::new(key_bytes.as_bytes())?;
+        Ok(())
     }
 
     fn insert_key(&self, key_id: String, key: SensitiveBytes) -> Result<()> {
