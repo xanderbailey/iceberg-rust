@@ -79,8 +79,8 @@ impl StandardKeyMetadata {
     }
 
     /// Returns the plaintext Data Encryption Key.
-    pub fn encryption_key(&self) -> &[u8] {
-        self.encryption_key.as_bytes()
+    pub fn encryption_key(&self) -> &SensitiveBytes {
+        &self.encryption_key
     }
 
     /// Returns the AAD prefix.
@@ -232,7 +232,7 @@ mod tests {
         let serialized = metadata.encode().unwrap();
         let parsed = StandardKeyMetadata::decode(&serialized).unwrap();
 
-        assert_eq!(parsed.encryption_key(), key);
+        assert_eq!(parsed.encryption_key().as_bytes(), key);
         assert_eq!(parsed.aad_prefix(), Some(aad.as_slice()));
         assert_eq!(parsed.file_length(), None);
     }
@@ -249,7 +249,7 @@ mod tests {
         let serialized = metadata.encode().unwrap();
         let parsed = StandardKeyMetadata::decode(&serialized).unwrap();
 
-        assert_eq!(parsed.encryption_key(), key);
+        assert_eq!(parsed.encryption_key().as_bytes(), key);
         assert_eq!(parsed.aad_prefix(), Some(aad.as_slice()));
         assert_eq!(parsed.file_length(), Some(file_length));
     }
@@ -275,7 +275,7 @@ mod tests {
         let serialized = metadata.encode().unwrap();
         let parsed = StandardKeyMetadata::decode(&serialized).unwrap();
 
-        assert_eq!(parsed.encryption_key(), &[1, 2, 3, 4]);
+        assert_eq!(parsed.encryption_key().as_bytes(), &[1, 2, 3, 4]);
         assert_eq!(parsed.aad_prefix(), None);
     }
 }
