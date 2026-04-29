@@ -19,9 +19,6 @@
 //! `org.apache.iceberg.encryption.StandardKeyMetadata`.
 
 use std::fmt;
-use std::io::Cursor;
-
-use apache_avro::{from_avro_datum, from_value, to_avro_datum, to_value};
 
 use super::SensitiveBytes;
 use crate::{Error, ErrorKind, Result};
@@ -95,62 +92,20 @@ impl StandardKeyMetadata {
 
     /// Encodes to Java-compatible format: `[0x01] [Avro binary datum]`
     pub fn encode(&self) -> Result<Box<[u8]>> {
-        let serde_repr = _serde::StandardKeyMetadataV1::from(self);
-
-        let value = to_value(serde_repr)
-            .and_then(|v| v.resolve(&_serde::AVRO_SCHEMA_V1))
-            .map_err(|e| {
-                Error::new(ErrorKind::Unexpected, "Failed to encode key metadata").with_source(e)
-            })?;
-
-        let datum = to_avro_datum(&_serde::AVRO_SCHEMA_V1, value).map_err(|e| {
-            Error::new(ErrorKind::Unexpected, "Failed to encode key metadata").with_source(e)
-        })?;
-
-        let mut result = Vec::with_capacity(1 + datum.len());
-        result.push(_serde::V1);
-        result.extend_from_slice(&datum);
-        Ok(result.into_boxed_slice())
+        _serde::StandardKeyMetadataV1::from(self).encode()
     }
 
     /// Decodes from Java-compatible format.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        if bytes.is_empty() {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                "Empty key metadata buffer",
-            ));
-        }
-
-        let version = bytes[0];
-        if version != _serde::V1 {
-            return Err(Error::new(
-                ErrorKind::FeatureUnsupported,
-                format!("Cannot resolve schema for version: {version}"),
-            ));
-        }
-
-        let mut reader = Cursor::new(&bytes[1..]);
-        let value = from_avro_datum(&_serde::AVRO_SCHEMA_V1, &mut reader, None).map_err(|e| {
-            Error::new(ErrorKind::DataInvalid, "Failed to decode key metadata").with_source(e)
-        })?;
-
-        let v1: _serde::StandardKeyMetadataV1 = from_value(&value).map_err(|e| {
-            Error::new(
-                ErrorKind::DataInvalid,
-                "Failed to decode key metadata fields",
-            )
-            .with_source(e)
-        })?;
-
-        Ok(Self::from(v1))
+        _serde::StandardKeyMetadataV1::decode(bytes).map(Self::from)
     }
 }
 
 mod _serde {
+    use std::io::Cursor;
     use std::sync::{Arc, LazyLock};
 
-    use apache_avro::Schema as AvroSchema;
+    use apache_avro::{from_avro_datum, from_value, to_avro_datum, to_value, Schema as AvroSchema};
     use serde::{Deserialize, Serialize};
 
     use super::*;
@@ -193,6 +148,58 @@ mod _serde {
         pub encryption_key: serde_bytes::ByteBuf,
         pub aad_prefix: Option<serde_bytes::ByteBuf>,
         pub file_length: Option<u64>,
+    }
+
+    impl StandardKeyMetadataV1 {
+        pub(super) fn encode(&self) -> Result<Box<[u8]>> {
+            let value = to_value(self)
+                .and_then(|v| v.resolve(&AVRO_SCHEMA_V1))
+                .map_err(|e| {
+                    Error::new(ErrorKind::Unexpected, "Failed to encode key metadata")
+                        .with_source(e)
+                })?;
+
+            let datum = to_avro_datum(&AVRO_SCHEMA_V1, value).map_err(|e| {
+                Error::new(ErrorKind::Unexpected, "Failed to encode key metadata").with_source(e)
+            })?;
+
+            let mut result = Vec::with_capacity(1 + datum.len());
+            result.push(V1);
+            result.extend_from_slice(&datum);
+            Ok(result.into_boxed_slice())
+        }
+
+        pub(super) fn decode(bytes: &[u8]) -> Result<Self> {
+            if bytes.is_empty() {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    "Empty key metadata buffer",
+                ));
+            }
+
+            let version = bytes[0];
+            if version != V1 {
+                return Err(Error::new(
+                    ErrorKind::FeatureUnsupported,
+                    format!("Cannot resolve schema for version: {version}"),
+                ));
+            }
+
+            let mut reader = Cursor::new(&bytes[1..]);
+            let value =
+                from_avro_datum(&AVRO_SCHEMA_V1, &mut reader, None).map_err(|e| {
+                    Error::new(ErrorKind::DataInvalid, "Failed to decode key metadata")
+                        .with_source(e)
+                })?;
+
+            from_value(&value).map_err(|e| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "Failed to decode key metadata fields",
+                )
+                .with_source(e)
+            })
+        }
     }
 
     impl From<&StandardKeyMetadata> for StandardKeyMetadataV1 {
