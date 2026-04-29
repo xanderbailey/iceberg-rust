@@ -36,10 +36,7 @@ use uuid::Uuid;
 const MILLIS_IN_DAY: i64 = 24 * 60 * 60 * 1000;
 
 use super::crypto::{AesGcmCipher, AesKeySize, SecureKey, SensitiveBytes};
-use super::encrypted_io::{
-    EncryptedInputFile, EncryptedOutputFile, NativeEncryptedInputFile, NativeEncryptedOutputFile,
-    NativeKeyMaterial,
-};
+use super::encrypted_io::{EncryptedInputFile, EncryptedOutputFile};
 use super::file_decryptor::AesGcmFileDecryptor;
 use super::file_encryptor::AesGcmFileEncryptor;
 use super::key_metadata::StandardKeyMetadata;
@@ -128,43 +125,15 @@ impl EncryptionManager {
         Ok(EncryptedInputFile::new(input, decryptor))
     }
 
-    /// Encrypt an output file for Parquet Modular Encryption (PME).
+    /// Generate key material for Parquet Modular Encryption (PME).
     ///
-    /// Returns a [`NativeEncryptedOutputFile`] whose key material is available
-    /// for the Parquet writer to configure `FileEncryptionProperties`.
-    pub fn encrypt_native(&self, raw_output: OutputFile) -> Result<NativeEncryptedOutputFile> {
+    /// Returns a [`StandardKeyMetadata`] containing a fresh DEK and AAD prefix.
+    /// The caller should pass this to the Parquet writer to configure
+    /// `FileEncryptionProperties`, and serialize it for storage in the manifest.
+    pub fn generate_native_key_metadata(&self) -> Result<StandardKeyMetadata> {
         let dek = SecureKey::generate(self.key_size);
         let aad_prefix = Self::generate_aad_prefix();
-
-        let key_metadata_bytes = StandardKeyMetadata::new(dek.as_bytes())
-            .with_aad_prefix(&aad_prefix)
-            .encode()?;
-
-        Ok(NativeEncryptedOutputFile::new(
-            raw_output,
-            key_metadata_bytes,
-            NativeKeyMaterial::new(SensitiveBytes::new(dek.as_bytes()), aad_prefix),
-        ))
-    }
-
-    /// Decrypt key metadata for a Parquet Modular Encryption (PME) file.
-    ///
-    /// Returns a [`NativeEncryptedInputFile`] carrying the plaintext DEK
-    /// and AAD prefix for the Parquet reader to configure
-    /// `FileDecryptionProperties`.
-    pub fn decrypt_native(
-        &self,
-        raw_input: InputFile,
-        key_metadata: &[u8],
-    ) -> Result<NativeEncryptedInputFile> {
-        let metadata = StandardKeyMetadata::decode(key_metadata)?;
-        Ok(NativeEncryptedInputFile::new(
-            raw_input,
-            NativeKeyMaterial::new(
-                metadata.encryption_key().clone(),
-                metadata.aad_prefix().unwrap_or_default().into(),
-            ),
-        ))
+        Ok(StandardKeyMetadata::new(dek.as_bytes()).with_aad_prefix(&aad_prefix))
     }
 
     /// Wrap key metadata bytes with a KEK for storage in table metadata.

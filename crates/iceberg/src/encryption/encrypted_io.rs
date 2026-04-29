@@ -21,7 +21,6 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use super::crypto::SensitiveBytes;
 use super::file_decryptor::AesGcmFileDecryptor;
 use super::file_encryptor::AesGcmFileEncryptor;
 use crate::io::{FileMetadata, FileRead, FileWrite, InputFile, OutputFile};
@@ -89,48 +88,6 @@ impl std::fmt::Debug for EncryptedInputFile {
     }
 }
 
-/// A Parquet Modular Encryption (PME) input file wrapping a plain [`InputFile`].
-///
-/// The Parquet reader handles decryption at the column/page level using the
-/// key material carried by this struct.
-pub struct NativeEncryptedInputFile {
-    inner: InputFile,
-    key_material: NativeKeyMaterial,
-}
-
-impl NativeEncryptedInputFile {
-    /// Creates a new native-encrypted input file.
-    pub fn new(inner: InputFile, key_material: NativeKeyMaterial) -> Self {
-        Self {
-            inner,
-            key_material,
-        }
-    }
-
-    /// Absolute path of the file.
-    pub fn location(&self) -> &str {
-        self.inner.location()
-    }
-
-    /// Returns the native key material for PME decryption.
-    pub fn key_material(&self) -> &NativeKeyMaterial {
-        &self.key_material
-    }
-
-    /// Consumes self and returns the underlying plain input file.
-    pub fn into_inner(self) -> InputFile {
-        self.inner
-    }
-}
-
-impl std::fmt::Debug for NativeEncryptedInputFile {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("NativeEncryptedInputFile")
-            .field("path", &self.inner.location())
-            .finish_non_exhaustive()
-    }
-}
-
 /// An AGS1 stream-encrypted output file wrapping a plain [`OutputFile`].
 ///
 /// Transparently encrypts on write.
@@ -193,97 +150,5 @@ impl std::fmt::Debug for EncryptedOutputFile {
         f.debug_struct("EncryptedOutputFile")
             .field("path", &self.inner.location())
             .finish_non_exhaustive()
-    }
-}
-
-/// A Parquet Modular Encryption (PME) output file wrapping a plain [`OutputFile`].
-///
-/// The Parquet writer handles encryption at the column/page level using the
-/// key material carried by this struct.
-pub struct NativeEncryptedOutputFile {
-    inner: OutputFile,
-    key_metadata: Box<[u8]>,
-    key_material: NativeKeyMaterial,
-}
-
-impl NativeEncryptedOutputFile {
-    /// Creates a new native-encrypted output file.
-    pub fn new(
-        inner: OutputFile,
-        key_metadata: Box<[u8]>,
-        key_material: NativeKeyMaterial,
-    ) -> Self {
-        Self {
-            inner,
-            key_metadata,
-            key_material,
-        }
-    }
-
-    /// Returns the key metadata bytes (for storage in manifest/data files).
-    pub fn key_metadata(&self) -> &[u8] {
-        &self.key_metadata
-    }
-
-    /// Absolute path of the file.
-    pub fn location(&self) -> &str {
-        self.inner.location()
-    }
-
-    /// Returns the native key material for PME encryption.
-    pub fn key_material(&self) -> &NativeKeyMaterial {
-        &self.key_material
-    }
-
-    /// Consumes self and returns the underlying plain output file.
-    pub fn into_inner(self) -> OutputFile {
-        self.inner
-    }
-}
-
-impl std::fmt::Debug for NativeEncryptedOutputFile {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("NativeEncryptedOutputFile")
-            .field("path", &self.inner.location())
-            .finish_non_exhaustive()
-    }
-}
-
-/// Plaintext key material for Parquet Modular Encryption (PME).
-///
-/// Carries the DEK and AAD prefix needed by a Parquet reader/writer to
-/// configure `FileEncryptionProperties` / `FileDecryptionProperties`.
-///
-/// Rust equivalent of Java's `NativeEncryptionKeyMetadata` interface.
-pub struct NativeKeyMaterial {
-    dek: SensitiveBytes,
-    /// AAD prefix is not secret — it is stored in plaintext in file metadata
-    /// and used for integrity (authenticated data), not confidentiality.
-    aad_prefix: Box<[u8]>,
-}
-
-impl NativeKeyMaterial {
-    /// Creates a new `NativeKeyMaterial`.
-    pub fn new(dek: SensitiveBytes, aad_prefix: Box<[u8]>) -> Self {
-        Self { dek, aad_prefix }
-    }
-
-    /// Returns the plaintext DEK.
-    pub fn dek(&self) -> &SensitiveBytes {
-        &self.dek
-    }
-
-    /// Returns the AAD prefix.
-    pub fn aad_prefix(&self) -> &[u8] {
-        &self.aad_prefix
-    }
-}
-
-impl std::fmt::Debug for NativeKeyMaterial {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("NativeKeyMaterial")
-            .field("dek", &self.dek)
-            .field("aad_prefix_len", &self.aad_prefix.len())
-            .finish()
     }
 }

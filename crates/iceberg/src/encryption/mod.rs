@@ -30,10 +30,7 @@ pub mod kms;
 mod stream;
 
 pub use crypto::{AesGcmCipher, AesKeySize, SecureKey, SensitiveBytes};
-pub use encrypted_io::{
-    EncryptedInputFile, EncryptedOutputFile, NativeEncryptedInputFile, NativeEncryptedOutputFile,
-    NativeKeyMaterial,
-};
+pub use encrypted_io::{EncryptedInputFile, EncryptedOutputFile};
 pub use encryption_manager::EncryptionManager;
 pub use file_decryptor::AesGcmFileDecryptor;
 pub use file_encryptor::AesGcmFileEncryptor;
