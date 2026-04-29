@@ -224,45 +224,6 @@ mod _serde {
     }
 }
 
-/// Plaintext key material for Parquet Modular Encryption (PME).
-///
-/// Carries the DEK and AAD prefix needed by a Parquet reader/writer to
-/// configure `FileEncryptionProperties` / `FileDecryptionProperties`.
-///
-/// Rust equivalent of Java's `NativeEncryptionKeyMetadata` interface.
-pub struct NativeKeyMaterial {
-    dek: SensitiveBytes,
-    /// AAD prefix is not secret — it is stored in plaintext in file metadata
-    /// and used for integrity (authenticated data), not confidentiality.
-    aad_prefix: Box<[u8]>,
-}
-
-impl NativeKeyMaterial {
-    /// Creates a new `NativeKeyMaterial`.
-    pub fn new(dek: SensitiveBytes, aad_prefix: Box<[u8]>) -> Self {
-        Self { dek, aad_prefix }
-    }
-
-    /// Returns the plaintext DEK.
-    pub fn dek(&self) -> &SensitiveBytes {
-        &self.dek
-    }
-
-    /// Returns the AAD prefix.
-    pub fn aad_prefix(&self) -> &[u8] {
-        &self.aad_prefix
-    }
-}
-
-impl std::fmt::Debug for NativeKeyMaterial {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("NativeKeyMaterial")
-            .field("dek", &self.dek)
-            .field("aad_prefix_len", &self.aad_prefix.len())
-            .finish()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

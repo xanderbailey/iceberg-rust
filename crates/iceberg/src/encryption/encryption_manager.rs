@@ -38,10 +38,11 @@ const MILLIS_IN_DAY: i64 = 24 * 60 * 60 * 1000;
 use super::crypto::{AesGcmCipher, AesKeySize, SecureKey, SensitiveBytes};
 use super::encrypted_io::{
     EncryptedInputFile, EncryptedOutputFile, NativeEncryptedInputFile, NativeEncryptedOutputFile,
+    NativeKeyMaterial,
 };
 use super::file_decryptor::AesGcmFileDecryptor;
 use super::file_encryptor::AesGcmFileEncryptor;
-use super::key_metadata::{NativeKeyMaterial, StandardKeyMetadata};
+use super::key_metadata::StandardKeyMetadata;
 use super::kms::KeyManagementClient;
 use crate::io::{InputFile, OutputFile};
 use crate::spec::EncryptedKey;
