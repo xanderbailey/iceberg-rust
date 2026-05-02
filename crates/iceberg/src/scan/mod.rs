@@ -61,6 +61,7 @@ pub struct TableScanBuilder<'a> {
     concurrency_limit_manifest_files: usize,
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
+    bloom_filter_enabled: bool,
 }
 
 impl<'a> TableScanBuilder<'a> {
@@ -79,6 +80,7 @@ impl<'a> TableScanBuilder<'a> {
             concurrency_limit_manifest_files: num_cpus,
             row_group_filtering_enabled: true,
             row_selection_enabled: false,
+            bloom_filter_enabled: false,
         }
     }
 
@@ -185,6 +187,20 @@ impl<'a> TableScanBuilder<'a> {
         self
     }
 
+    /// Determines whether to enable bloom filter-based row group filtering.
+    ///
+    /// When enabled, if a read is performed with an equality or IN predicate,
+    /// the bloom filter for relevant columns in each row group is read and
+    /// checked. Row groups where the bloom filter proves the value is absent
+    /// are skipped entirely.
+    ///
+    /// Defaults to disabled, as reading bloom filters requires additional I/O
+    /// per column per row group.
+    pub fn with_bloom_filter_enabled(mut self, bloom_filter_enabled: bool) -> Self {
+        self.bloom_filter_enabled = bloom_filter_enabled;
+        self
+    }
+
     /// Build the table scan.
     pub fn build(self) -> Result<TableScan> {
         let snapshot = match self.snapshot_id {
@@ -211,6 +227,7 @@ impl<'a> TableScanBuilder<'a> {
                         concurrency_limit_manifest_files: self.concurrency_limit_manifest_files,
                         row_group_filtering_enabled: self.row_group_filtering_enabled,
                         row_selection_enabled: self.row_selection_enabled,
+                        bloom_filter_enabled: self.bloom_filter_enabled,
                     });
                 };
                 current_snapshot_id.clone()
@@ -304,6 +321,7 @@ impl<'a> TableScanBuilder<'a> {
             concurrency_limit_manifest_files: self.concurrency_limit_manifest_files,
             row_group_filtering_enabled: self.row_group_filtering_enabled,
             row_selection_enabled: self.row_selection_enabled,
+            bloom_filter_enabled: self.bloom_filter_enabled,
         })
     }
 }
@@ -332,6 +350,7 @@ pub struct TableScan {
 
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
+    bloom_filter_enabled: bool,
 }
 
 impl TableScan {
@@ -436,7 +455,8 @@ impl TableScan {
         let mut arrow_reader_builder = ArrowReaderBuilder::new(self.file_io.clone())
             .with_data_file_concurrency_limit(self.concurrency_limit_data_files)
             .with_row_group_filtering_enabled(self.row_group_filtering_enabled)
-            .with_row_selection_enabled(self.row_selection_enabled);
+            .with_row_selection_enabled(self.row_selection_enabled)
+            .with_bloom_filter_enabled(self.bloom_filter_enabled);
 
         if let Some(batch_size) = self.batch_size {
             arrow_reader_builder = arrow_reader_builder.with_batch_size(batch_size);

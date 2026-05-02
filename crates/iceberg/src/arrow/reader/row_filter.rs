@@ -196,7 +196,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::cast::AsArray;
-    use arrow_array::{ArrayRef, LargeStringArray, RecordBatch, StringArray};
+    use arrow_array::{ArrayRef, Int32Array, LargeStringArray, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use futures::TryStreamExt;
     use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
@@ -615,5 +615,180 @@ mod tests {
 
             assert_eq!(first_val, 100, "Task 2 should start with id=100, not id=0");
         }
+    }
+
+    /// Tests that bloom filter pushdown correctly prunes row groups.
+    #[tokio::test]
+    async fn test_bloom_filter_pushdown_prunes_row_groups() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+        ]));
+
+        let tmp_dir = TempDir::new().unwrap();
+        let file_path = format!("{}/bloom_test.parquet", tmp_dir.path().to_str().unwrap());
+
+        // Write a Parquet file with 3 row groups, each containing distinct values,
+        // with bloom filters enabled.
+        // Row group 0: ids 0..100
+        // Row group 1: ids 100..200
+        // Row group 2: ids 200..300
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .set_max_row_group_row_count(Some(100))
+            .set_bloom_filter_enabled(true)
+            .build();
+
+        let file = File::create(&file_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, arrow_schema.clone(), Some(props)).unwrap();
+
+        for batch_start in [0, 100, 200] {
+            let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
+                Int32Array::from((batch_start..batch_start + 100).collect::<Vec<i32>>()),
+            )])
+            .unwrap();
+            writer.write(&batch).unwrap();
+        }
+        writer.close().unwrap();
+
+        let file_io = FileIO::new_with_fs();
+
+        // Query for id = 150, which is only in row group 1.
+        // With bloom filter pushdown, row groups 0 and 2 should be pruned.
+        let predicate = Reference::new("id").equal_to(Datum::int(150));
+
+        let reader = ArrowReaderBuilder::new(file_io.clone())
+            .with_bloom_filter_enabled(true)
+            .build();
+
+        let tasks = Box::pin(futures::stream::iter(vec![Ok(FileScanTask {
+            file_size_in_bytes: std::fs::metadata(&file_path).unwrap().len(),
+            start: 0,
+            length: 0,
+            record_count: None,
+            data_file_path: file_path.clone(),
+            data_file_format: DataFileFormat::Parquet,
+            schema: schema.clone(),
+            project_field_ids: vec![1],
+            predicate: Some(predicate.bind(schema.clone(), true).unwrap()),
+            deletes: vec![],
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
+            case_sensitive: false,
+        })])) as FileScanTaskStream;
+
+        let result = reader
+            .read(tasks)
+            .unwrap()
+            .stream()
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .unwrap();
+
+        // Only row group 1 (ids 100..200) should be read. The row filter
+        // then further filters to just id=150.
+        let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 1, "Should find exactly one row matching id=150");
+
+        let id_col = result[0]
+            .column(0)
+            .as_primitive::<arrow_array::types::Int32Type>();
+        assert_eq!(id_col.value(0), 150);
+    }
+
+    /// Tests that bloom filter pushdown skips all row groups when value is absent.
+    #[tokio::test]
+    async fn test_bloom_filter_pushdown_value_absent() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+        ]));
+
+        let tmp_dir = TempDir::new().unwrap();
+        let file_path = format!("{}/bloom_absent.parquet", tmp_dir.path().to_str().unwrap());
+
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .set_max_row_group_row_count(Some(100))
+            .set_bloom_filter_enabled(true)
+            .build();
+
+        let file = File::create(&file_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, arrow_schema.clone(), Some(props)).unwrap();
+
+        for batch_start in [0, 100, 200] {
+            let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
+                Int32Array::from((batch_start..batch_start + 100).collect::<Vec<i32>>()),
+            )])
+            .unwrap();
+            writer.write(&batch).unwrap();
+        }
+        writer.close().unwrap();
+
+        let file_io = FileIO::new_with_fs();
+
+        // Query for id = 999, which doesn't exist in any row group.
+        // All row groups should be pruned by bloom filter.
+        let predicate = Reference::new("id").equal_to(Datum::int(999));
+
+        let reader = ArrowReaderBuilder::new(file_io)
+            .with_bloom_filter_enabled(true)
+            .build();
+
+        let tasks = Box::pin(futures::stream::iter(vec![Ok(FileScanTask {
+            file_size_in_bytes: std::fs::metadata(&file_path).unwrap().len(),
+            start: 0,
+            length: 0,
+            record_count: None,
+            data_file_path: file_path.clone(),
+            data_file_format: DataFileFormat::Parquet,
+            schema: schema.clone(),
+            project_field_ids: vec![1],
+            predicate: Some(predicate.bind(schema, true).unwrap()),
+            deletes: vec![],
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
+            case_sensitive: false,
+        })])) as FileScanTaskStream;
+
+        let result = reader
+            .read(tasks)
+            .unwrap()
+            .stream()
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .unwrap();
+
+        let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            total_rows, 0,
+            "Should find zero rows when value is absent from all bloom filters"
+        );
     }
 }
