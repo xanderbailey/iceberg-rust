@@ -104,9 +104,8 @@ Master Key (in KMS)
 │  - KEK cache (moka async, configurable TTL)                                 │
 │  - Automatic KEK rotation (730 days, KEY_TIMESTAMP tracking)                │
 │  - encrypt() / decrypt() for AGS1 stream files                              │
-│  - encrypt_native() for Parquet Modular Encryption                          │
+│  - generate_native_key_metadata() for Parquet Modular Encryption            │
 │  - wrap/unwrap_key_metadata() for manifest list keys (KEK + KMS)            │
-│  - generate_dek() for per-file plaintext DEK generation                     │
 │  - Constructed per-table by KmsClientFactory                                │
 └─────────────────────────────────────────────────────────────────────────────┘
               │                              │
@@ -209,11 +208,14 @@ SnapshotProducer::commit()
        a. em.encrypt(output_file) → generates random plaintext DEK + AAD prefix
        b. Write manifest list to AGS1-encrypting OutputFile
        c. Get or create KEK:
-          - Find unexpired KEK (check KEY_TIMESTAMP, 730-day lifespan)
+          - Find newest unexpired KEK by KEY_TIMESTAMP
           - If none: generate new KEK, wrap via KMS: kms_client.wrap_key(kek, table_key_id)
        d. AES-GCM encrypt the manifest list's StandardKeyMetadata using the KEK,
           with KEY_TIMESTAMP as AAD
-       e. Store as EncryptedKey (encrypted_by_id = kek_id) in encryption manager
+       e. wrap_key_metadata() returns (EncryptedKey, Option<EncryptedKey>)
+          - The EncryptedKey entry (encrypted_by_id = kek_id)
+          - Optionally a new KEK if one was created/rotated
+          - Caller persists both via AddEncryptionKey in the commit
        f. Store manifest list key_id on Snapshot.encryption_key_id
     3. Table commit includes AddEncryptionKey for all new entries:
        - New KEKs (encrypted_by_id = table_key_id, properties include KEY_TIMESTAMP)
@@ -407,6 +409,8 @@ impl EncryptionManager {
     ) -> Result<Vec<u8>>;
 
     /// Wrap key metadata for a manifest list with a KEK for storage in table metadata.
+    /// Returns (wrapped_entry, optional_new_kek). The caller must persist both via
+    /// AddEncryptionKey — the manager does not store new KEKs internally.
     pub async fn wrap_key_metadata(
         &self, key_metadata: &[u8],
     ) -> Result<(EncryptedKey, Option<EncryptedKey>)>;
