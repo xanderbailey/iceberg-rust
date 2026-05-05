@@ -35,8 +35,8 @@ production-tested. It defines:
 
 - **`EncryptionManager`** -- orchestrates encrypt/decrypt of `InputFile`/`OutputFile`
 - **`KeyManagementClient`** -- pluggable KMS integration (wrap/unwrap keys)
-- **`EncryptedInputFile` / `NativeEncryptedInputFile` / `EncryptedOutputFile` / `NativeEncryptedOutputFile`** --
-  thin wrappers pairing a raw file handle with its encryption key material
+- **`EncryptedInputFile` / `EncryptedOutputFile`** --
+  thin AGS1 wrappers pairing a raw file handle with its encryption key material
 - **`StandardEncryptionManager`** -- envelope encryption with key caching, AGS1 streams,
   and Parquet native encryption support
 - **`StandardKeyMetadata`** -- Avro-serialized key metadata (wrapped DEK, AAD prefix, file length)
@@ -44,10 +44,10 @@ production-tested. It defines:
 
 ### Relationship to Storage Trait RFC
 
-[RFC 0002 (Making Storage a Trait)](https://github.com/apache/iceberg-rust/pull/2116) proposes
-converting `Storage` from an enum to a trait and removing the `Extensions` mechanism from
-`FileIOBuilder`. This encryption RFC is designed to work both with the current `Extensions`-based
-`FileIO` and with the future trait-based storage. Specific adaptation points are called out below.
+[RFC 0002 (Making Storage a Trait)](https://github.com/apache/iceberg-rust/pull/2116) has landed,
+converting `Storage` from an enum to a trait. This encryption RFC keeps `FileIO` entirely
+encryption-unaware — the `EncryptionManager` lives on the `Table` and is passed explicitly
+to components that need it.
 
 ---
 
@@ -163,16 +163,16 @@ Snapshot  │
     3. AES-GCM decrypt the manifest list's StandardKeyMetadata using the
        unwrapped KEK, with KEY_TIMESTAMP as AAD
     4. Extract plaintext manifest list DEK from decrypted StandardKeyMetadata
-    5. file_io.new_encrypted_input(path, key_metadata) → AGS1-decrypting InputFile
+    5. em.decrypt(input_file, key_metadata) → AGS1-decrypting EncryptedInputFile
           │
           ▼
 ManifestFile
   └── key_metadata: Option<Vec<u8>>  (plaintext StandardKeyMetadata, read from encrypted manifest list)
           │
-  load_manifest(file_io)
+  load_manifest(file_io, encryption_manager)
     1. If key_metadata present:
        a. Parse StandardKeyMetadata → extract plaintext DEK + AAD prefix
-       b. file_io.new_encrypted_input() → AGS1-decrypting InputFile
+       b. em.decrypt(input_file, key_metadata) → AGS1-decrypting EncryptedInputFile
     2. If not: file_io.new_input()
           │
           ▼
@@ -181,9 +181,9 @@ FileScanTask
           │
   ArrowReader::create_parquet_record_batch_stream_builder_with_key_metadata()
     1. If key_metadata present:
-       a. file_io.new_native_encrypted_input(path, key_metadata) → NativeEncryptedInputFile
-       b. Extract NativeKeyMaterial (plaintext DEK + AAD prefix)
-       c. Build FileDecryptionProperties from NativeKeyMaterial
+       a. Deserialize key_metadata bytes → StandardKeyMetadata
+       b. Extract plaintext DEK + AAD prefix from StandardKeyMetadata
+       c. Build FileDecryptionProperties
        d. Pass to ParquetRecordBatchStreamBuilder
     2. If not: standard Parquet read
 ```
@@ -192,13 +192,12 @@ FileScanTask
 
 ```
 RollingFileWriter::new_output_file()
-    1. If file_io.encryption_manager() is Some:
-       a. file_io.new_native_encrypted_output(path) → NativeEncryptedOutputFile
-       b. EncryptionManager generates random plaintext DEK + AAD prefix
-       c. NativeEncryptedOutputFile carries NativeKeyMaterial for Parquet writer
-       d. Store plaintext StandardKeyMetadata as key_metadata bytes on DataFile
+    1. If encryption_manager is Some:
+       a. em.generate_native_key_metadata() → StandardKeyMetadata (plaintext DEK + AAD prefix)
+       b. Pass StandardKeyMetadata to ParquetWriter
+       c. Store serialized StandardKeyMetadata as key_metadata bytes on DataFile
           (protected by being stored inside the encrypted parent manifest)
-    2. ParquetWriter extracts NativeKeyMaterial, configures FileEncryptionProperties
+    2. ParquetWriter extracts DEK + AAD from StandardKeyMetadata, configures FileEncryptionProperties
 
 SnapshotProducer::commit()
     1. Manifest writing:
@@ -233,7 +232,7 @@ crates/iceberg/src/
 │   ├── encryption_manager.rs        # EncryptionManager (concrete struct)
 │   ├── file_encryptor.rs            # FileEncryptor (write-side AGS1 wrapper)
 │   ├── file_decryptor.rs            # FileDecryptor (read-side AGS1 wrapper)
-│   ├── encrypted_io.rs              # Encrypted / NativeEncrypted InputFile / OutputFile structs
+│   ├── encrypted_io.rs              # EncryptedInputFile / EncryptedOutputFile (AGS1 wrappers)
 │   ├── stream.rs                    # AesGcmFileRead / AesGcmFileWrite (AGS1 format)
 │   ├── kms/
 │   │   ├── mod.rs                   # KmsClientFactory trait
@@ -391,11 +390,9 @@ impl EncryptionManager {
     /// Encrypt a file with AGS1 stream encryption.
     pub async fn encrypt(&self, raw_output: OutputFile) -> Result<EncryptedOutputFile>;
 
-    /// Encrypt for Parquet Modular Encryption (generates NativeKeyMaterial).
-    pub async fn encrypt_native(&self, raw_output: OutputFile) -> Result<NativeEncryptedOutputFile>;
-
-    /// Decrypt key metadata for a Parquet Modular Encryption (PME) file.
-    pub fn decrypt_native(&self, raw_input: InputFile, key_metadata: &[u8]) -> Result<NativeEncryptedInputFile>;
+    /// Generate key material for Parquet Modular Encryption (PME).
+    /// Returns a StandardKeyMetadata containing a fresh DEK and AAD prefix.
+    pub fn generate_native_key_metadata(&self) -> Result<StandardKeyMetadata>;
 
     /// Unwrap key metadata for a manifest list.
     /// 1. Look up the manifest list's EncryptedKey by key ID
@@ -458,18 +455,12 @@ block to its position in the stream to prevent reordering attacks.
 random-access reads. **`AesGcmFileWrite`** implements `FileWrite` for transparent AGS1
 encryption with block buffering.
 
-### Encrypted File Wrappers
+### Encrypted File Wrappers (AGS1 Only)
 
 Rather than adding encryption variants to `InputFile`/`OutputFile` (which would change the
-public API of those core types), encryption uses dedicated wrapper structs. These wrap a
-plain `InputFile`/`OutputFile` and add encryption/decryption capabilities. The plain
-`InputFile`/`OutputFile` types remain unchanged.
-
-AGS1 stream encryption and Parquet Modular Encryption (PME) are separate structs rather
-than enum variants because they are used in entirely different code paths — AGS1 for
-manifests and manifest lists, PME for data files. Separate types give compile-time safety:
-a function handling PME takes `NativeEncryptedInputFile` and cannot accidentally receive
-an AGS1 file.
+public API of those core types), AGS1 stream encryption uses dedicated wrapper structs.
+These wrap a plain `InputFile`/`OutputFile` and add encryption/decryption capabilities.
+The plain `InputFile`/`OutputFile` types remain unchanged.
 
 ```rust
 /// AGS1 stream-encrypted input file. Decrypted transparently on read.
@@ -478,70 +469,53 @@ pub struct EncryptedInputFile {
     decryptor: Arc<AesGcmFileDecryptor>,
 }
 
-/// Parquet Modular Encryption input file.
-/// The Parquet reader handles decryption at the column/page level.
-pub struct NativeEncryptedInputFile {
-    inner: InputFile,
-    key_material: NativeKeyMaterial,
-}
-
 /// AGS1 stream-encrypted output file. Encrypted transparently on write.
 pub struct EncryptedOutputFile {
     inner: OutputFile,
     key_metadata: Box<[u8]>,
     encryptor: Arc<AesGcmFileEncryptor>,
 }
-
-/// Parquet Modular Encryption output file.
-/// The Parquet writer handles encryption at the column/page level.
-pub struct NativeEncryptedOutputFile {
-    inner: OutputFile,
-    key_metadata: Box<[u8]>,
-    key_material: NativeKeyMaterial,
-}
 ```
 
 `EncryptedInputFile` and `EncryptedOutputFile` delegate standard operations (`location()`,
 `read()`, `reader()`, `writer()`) to the inner file, transparently encrypting/decrypting
-via `AesGcmFileRead`/`AesGcmFileWrite`. `NativeEncryptedInputFile` and
-`NativeEncryptedOutputFile` carry `NativeKeyMaterial` (plaintext DEK and AAD prefix)
-for the Parquet reader/writer to configure `FileDecryptionProperties` /
-`FileEncryptionProperties`. All four types provide `into_inner()` to recover the
+via `AesGcmFileRead`/`AesGcmFileWrite`. Both provide `into_inner()` to recover the
 underlying plain file.
+
+Parquet Modular Encryption (PME) does not use wrapper types. Instead, the Parquet
+reader/writer receives `StandardKeyMetadata` directly from the `EncryptionManager` and
+uses it to configure `FileDecryptionProperties`/`FileEncryptionProperties` (see
+[Parquet Modular Encryption](#parquet-modular-encryption) below).
 
 This wrapper approach means `ManifestReader` and `ManifestListWriter` accept the AGS1
 wrapper types (or `Box<dyn FileWrite>`) where encryption is needed, while the Parquet
-writer accepts `NativeEncryptedOutputFile`, rather than requiring changes to the
-`InputFile`/`OutputFile` types themselves.
+writer works with plain `OutputFile` plus `StandardKeyMetadata`, rather than requiring
+changes to the `InputFile`/`OutputFile` types themselves.
 
 ### FileIO Integration
 
-The `EncryptionManager` is attached to `FileIO` via a convenience method. The encryption
-manager is typically created automatically by `TableBuilder::build()` using the catalog's
-`KmsClientFactory`, but can also be attached directly for testing:
+`FileIO` is **encryption-unaware**. It has no knowledge of encryption, no encrypted factory
+methods, and no reference to the `EncryptionManager`. This keeps `FileIO` focused on
+storage concerns only.
+
+The `EncryptionManager` lives on the `Table` and is passed explicitly to components that
+need it (e.g. `SnapshotProducer`, `ArrowReader`, `ParquetWriter`). This is more explicit
+than assuming FileIO has been configured correctly.
 
 ```rust
-// Typically automatic via catalog + KmsClientFactory (see Catalog Integration).
-// For manual/test setup:
-let file_io = file_io.with_encryption_manager(Arc::new(encryption_manager));
+// EncryptionManager is accessed from the Table:
+let em = table.encryption_manager(); // Option<&Arc<EncryptionManager>>
+
+// AGS1 encryption for manifests/manifest lists:
+let encrypted_output = em.encrypt(plain_output_file).await?;
+let encrypted_input = em.decrypt(plain_input_file, key_metadata).await?;
+
+// PME key material for Parquet data files:
+let key_metadata = em.generate_native_key_metadata()?;
 ```
 
-FileIO provides encryption-aware factory methods:
-
-| Method | Returns | Purpose |
-|--------|---------|---------|
-| `new_encrypted_input(path, key_metadata)` | `EncryptedInputFile` | AGS1 stream decryption (manifests, manifest lists) |
-| `new_encrypted_output(path)` | `EncryptedOutputFile` | AGS1 stream encryption |
-| `new_native_encrypted_input(path, key_metadata)` | `NativeEncryptedInputFile` | PME input (Parquet handles decryption) |
-| `new_native_encrypted_output(path)` | `NativeEncryptedOutputFile` | PME output (Parquet handles encryption) |
-| `encryption_manager()` | `Option<Arc<EncryptionManager>>` | Returns the configured EncryptionManager, if any |
-
-#### After Storage Trait RFC
-
-RFC 0002 removes `Extensions` from `FileIOBuilder`. The `KmsClientFactory` will be
-provided at the catalog level (Option A), which is consistent with the wrapper approach
-for the encrypted file wrappers — encryption operates at the `FileIO` level rather than
-wrapping storage:
+The `KmsClientFactory` is provided at the catalog level, which constructs the
+`EncryptionManager` per-table during `TableBuilder::build()`:
 
 ```rust
 let catalog = GlueCatalogBuilder::default()
@@ -557,15 +531,18 @@ by the storage trait changes.
 ### Parquet Modular Encryption
 
 For Parquet data files, encryption is handled natively by the Parquet reader/writer using
-`FileEncryptionProperties` and `FileDecryptionProperties` from `parquet-rs`.
+`FileEncryptionProperties` and `FileDecryptionProperties` from `parquet-rs`. No dedicated
+wrapper types are needed — the Parquet layer works with plain `InputFile`/`OutputFile`
+plus `StandardKeyMetadata` for key material.
 
-**Write path** (`ParquetWriter`): When given a `NativeEncryptedOutputFile`, the writer extracts
-`NativeKeyMaterial` (plaintext DEK + AAD prefix) and configures `FileEncryptionProperties` on the
-`AsyncArrowWriter`. The Parquet crate handles column/page-level encryption.
+**Write path** (`ParquetWriter`): The writer receives a `&StandardKeyMetadata` (from
+`EncryptionManager::generate_native_key_metadata()`), extracts the plaintext DEK and AAD
+prefix, and configures `FileEncryptionProperties` on the `AsyncArrowWriter`. The Parquet
+crate handles column/page-level encryption. The output file itself is a plain `OutputFile`.
 
-**Read path** (`ArrowReader`): When `FileScanTask.key_metadata` is present, the reader calls
-`file_io.new_native_encrypted_input()` which returns a `NativeEncryptedInputFile`. The reader
-extracts `NativeKeyMaterial` to build `FileDecryptionProperties` which are passed to
+**Read path** (`ArrowReader`): When `FileScanTask.key_metadata` is present, the reader
+deserializes the raw bytes into a `StandardKeyMetadata`, extracts the DEK and AAD prefix,
+and builds `FileDecryptionProperties` which are passed to
 `ParquetRecordBatchStreamBuilder::new_with_options()`.
 
 The `ArrowFileReader::get_metadata()` implementation forwards both `file_decryption_properties`
@@ -665,7 +642,7 @@ This is the Rust equivalent of Java's `RESTTableOperations.io()` which calls
       - `table_key_id` from the `encryption.key-id` table property
       - `encryption_keys` from `TableMetadata.encryption_keys` (the KEK map)
       - The `KeyManagementClient` from the factory
-4. Attach the `EncryptionManager` to the table's `FileIO`.
+4. Store the `EncryptionManager` on the `Table`.
 
 This runs on every `Table::builder().build()` call, so each table gets a correctly configured
 per-table `EncryptionManager` even when a single catalog manages tables with different key IDs.
@@ -673,20 +650,20 @@ per-table `EncryptionManager` even when a single catalog manages tables with dif
 ```rust
 // User code — just provide the factory, everything else is automatic:
 let table = catalog.load_table(&ident).await?;
-// table.file_io() now has an EncryptionManager configured with
+// table.encryption_manager() returns the EncryptionManager configured with
 // the correct table_key_id and encryption_keys from this table's metadata.
 ```
 
-`Table::with_file_io()` replaces the table's `FileIO` and rebuilds its `ObjectCache` (which
-stores its own `FileIO` for manifest/manifest list loading).
+The `EncryptionManager` is passed explicitly from the `Table` to components that need it
+(e.g. `ObjectCache`, `SnapshotProducer`, `ArrowReader`, `RollingFileWriter`).
 
 ### DataFusion Integration
 
 The DataFusion integration requires **no encryption-specific code**. Encryption flows
 transparently through the existing pipeline:
 
-- **`IcebergTableProvider::scan()`** calls `catalog.load_table()` → table has encrypted FileIO → `IcebergTableScan` → `table.scan().to_arrow()` → `ArrowReader` decrypts via `key_metadata`
-- **`IcebergTableProvider::insert_into()`** calls `catalog.load_table()` → table has encrypted FileIO → `IcebergWriteExec` uses `table.file_io()` → `RollingFileWriterBuilder` detects encryption → PME-encrypted data files + AGS1-encrypted manifests
+- **`IcebergTableProvider::scan()`** calls `catalog.load_table()` → table has `EncryptionManager` → `IcebergTableScan` → `table.scan().to_arrow()` → `ArrowReader` decrypts via `key_metadata`
+- **`IcebergTableProvider::insert_into()`** calls `catalog.load_table()` → table has `EncryptionManager` → `IcebergWriteExec` uses `table.encryption_manager()` → `RollingFileWriterBuilder` encrypts → PME-encrypted data files + AGS1-encrypted manifests
 - **`IcebergCommitExec`** uses `Transaction::fast_append()` → `SnapshotProducer` writes encrypted manifests/manifest list → `AddEncryptionKey` updates persisted in table metadata
 
 ### Format Version Requirement
