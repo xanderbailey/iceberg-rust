@@ -161,9 +161,8 @@ impl EncryptionManager {
         let kek_bytes = self.unwrap_kek(&kek).await?;
 
         // Use the KEK timestamp as AAD to prevent timestamp tampering attacks.
-        let kek_timestamp = kek.properties().get(KEK_CREATED_AT_PROPERTY);
-        let aad = kek_timestamp.map(|ts| ts.as_bytes());
-        let wrapped_metadata = self.wrap_dek_with_kek(key_metadata, &kek_bytes, aad)?;
+        let aad = Self::kek_timestamp_aad(&kek)?;
+        let wrapped_metadata = self.wrap_dek_with_kek(key_metadata, &kek_bytes, Some(aad))?;
 
         let wrapped_key = EncryptedKey::builder()
             .key_id(Uuid::new_v4().to_string())
@@ -309,21 +308,34 @@ impl EncryptionManager {
             )
         })?;
 
-        // The Iceberg Spec uses the KEK timestamp as AAD when wrapping key metadata, to
-        // prevent timestamp tampering attacks.
-        let aad = kek
-            .properties()
-            .get(KEK_CREATED_AT_PROPERTY)
-            .map(|ts| ts.as_bytes());
+        // KEK timestamp as AAD prevents timestamp tampering.
+        let aad = Self::kek_timestamp_aad(kek)?;
 
         let kek_bytes = self.unwrap_kek(kek).await?;
-        self.unwrap_dek_with_kek(wrapped_dek, &kek_bytes, aad)
+        self.unwrap_dek_with_kek(wrapped_dek, &kek_bytes, Some(aad))
             .map_err(|e| {
                 Error::new(
                     e.kind(),
                     format!("Failed to unwrap key metadata with KEK '{kek_key_id}'"),
                 )
                 .with_source(e)
+            })
+    }
+
+    /// Extract the KEK timestamp for use as AAD. Returns an error if missing.
+    fn kek_timestamp_aad(kek: &EncryptedKey) -> Result<&[u8]> {
+        kek.properties()
+            .get(KEK_CREATED_AT_PROPERTY)
+            .map(|ts| ts.as_bytes())
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "KEK '{}' is missing required '{}' property",
+                        kek.key_id(),
+                        KEK_CREATED_AT_PROPERTY
+                    ),
+                )
             })
     }
 
@@ -581,6 +593,82 @@ mod tests {
 
         let meta = decrypted_file.metadata().await.unwrap();
         assert_eq!(meta.size, plaintext.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn test_unwrap_fails_when_kek_missing_timestamp() {
+        let kms = create_test_kms();
+        let mgr = EncryptionManager::builder()
+            .kms_client(Arc::clone(&kms))
+            .table_key_id("master-1")
+            .build();
+
+        // Wrap some metadata to get a valid encrypted entry
+        let (entry, new_kek) = mgr.wrap_key_metadata(b"secret").await.unwrap();
+        let kek = new_kek.unwrap();
+
+        // Re-create the KEK without its KEY_TIMESTAMP property
+        let kek_no_ts = EncryptedKey::builder()
+            .key_id(kek.key_id())
+            .encrypted_key_metadata(kek.encrypted_key_metadata())
+            .encrypted_by_id(kek.encrypted_by_id().unwrap())
+            .build();
+
+        let mut encryption_keys = HashMap::new();
+        encryption_keys.insert(kek_no_ts.key_id().to_string(), kek_no_ts);
+
+        let mgr = EncryptionManager::builder()
+            .kms_client(kms)
+            .table_key_id("master-1")
+            .encryption_keys(encryption_keys.clone())
+            .build();
+
+        let result = mgr.unwrap_key_metadata(&entry, &encryption_keys).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.to_string().contains(KEK_CREATED_AT_PROPERTY),
+            "error should mention the missing property: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unwrap_fails_when_kek_timestamp_tampered() {
+        let kms = create_test_kms();
+        let mgr = EncryptionManager::builder()
+            .kms_client(Arc::clone(&kms))
+            .table_key_id("master-1")
+            .build();
+
+        // Wrap metadata normally
+        let (entry, new_kek) = mgr.wrap_key_metadata(b"secret").await.unwrap();
+        let kek = new_kek.unwrap();
+
+        // Tamper with the KEK timestamp (change the AAD)
+        let mut tampered_properties = kek.properties().clone();
+        tampered_properties.insert(KEK_CREATED_AT_PROPERTY.to_string(), "9999999".to_string());
+
+        let tampered_kek = EncryptedKey::builder()
+            .key_id(kek.key_id())
+            .encrypted_key_metadata(kek.encrypted_key_metadata())
+            .encrypted_by_id(kek.encrypted_by_id().unwrap())
+            .properties(tampered_properties)
+            .build();
+
+        let mut encryption_keys = HashMap::new();
+        encryption_keys.insert(tampered_kek.key_id().to_string(), tampered_kek);
+
+        let mgr = EncryptionManager::builder()
+            .kms_client(kms)
+            .table_key_id("master-1")
+            .encryption_keys(encryption_keys.clone())
+            .build();
+
+        // Unwrap should fail because the AAD (timestamp) doesn't match what was used to wrap
+        let result = mgr.unwrap_key_metadata(&entry, &encryption_keys).await;
+        assert!(result.is_err(), "tampered timestamp should cause decryption failure");
     }
 
     #[tokio::test]
