@@ -668,7 +668,10 @@ mod tests {
 
         // Unwrap should fail because the AAD (timestamp) doesn't match what was used to wrap
         let result = mgr.unwrap_key_metadata(&entry, &encryption_keys).await;
-        assert!(result.is_err(), "tampered timestamp should cause decryption failure");
+        assert!(
+            result.is_err(),
+            "tampered timestamp should cause decryption failure"
+        );
     }
 
     #[tokio::test]
