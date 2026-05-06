@@ -31,6 +31,7 @@ use std::time::Duration;
 use aes_gcm::aead::OsRng;
 use aes_gcm::aead::rand_core::RngCore;
 use chrono::Utc;
+use moka::future::Cache;
 use uuid::Uuid;
 
 const MILLIS_IN_DAY: i64 = 24 * 60 * 60 * 1000;
@@ -66,10 +67,10 @@ const AAD_PREFIX_LENGTH: usize = 16;
 pub struct EncryptionManager {
     kms_client: Arc<dyn KeyManagementClient>,
     #[builder(
-        default = moka::future::Cache::builder().time_to_live(DEFAULT_CACHE_TTL).build(),
+        default = Cache::builder().time_to_live(DEFAULT_CACHE_TTL).build(),
         setter(skip)
     )]
-    kek_cache: moka::future::Cache<String, SensitiveBytes>,
+    kek_cache: Cache<String, SensitiveBytes>,
     /// AES key size for DEK generation. Defaults to 128-bit.
     #[builder(default = AesKeySize::default())]
     key_size: AesKeySize,
