@@ -36,7 +36,7 @@ use uuid::Uuid;
 const MILLIS_IN_DAY: i64 = 24 * 60 * 60 * 1000;
 
 use super::crypto::{AesGcmCipher, AesKeySize, SecureKey, SensitiveBytes};
-use super::encrypted_io::{EncryptedInputFile, EncryptedOutputFile};
+use super::io::{EncryptedInputFile, EncryptedOutputFile};
 use super::file_decryptor::AesGcmFileDecryptor;
 use super::file_encryptor::AesGcmFileEncryptor;
 use super::key_metadata::StandardKeyMetadata;
