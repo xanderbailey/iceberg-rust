@@ -64,6 +64,16 @@ const AAD_PREFIX_LENGTH: usize = 16;
 ///
 /// Uses an async cache for unwrapped KEK bytes to avoid repeated KMS calls.
 #[derive(typed_builder::TypedBuilder)]
+#[builder(mutators(
+    /// Add an encryption key (KEK or wrapped key metadata entry).
+    pub fn add_encryption_key(&mut self, key: EncryptedKey) {
+        self.encryption_keys.insert(key.key_id().to_string(), key);
+    }
+    /// Set all encryption keys from table metadata.
+    pub fn encryption_keys(&mut self, keys: HashMap<String, EncryptedKey>) {
+        self.encryption_keys = keys;
+    }
+))]
 pub struct EncryptionManager {
     kms_client: Arc<dyn KeyManagementClient>,
     #[builder(
@@ -78,7 +88,7 @@ pub struct EncryptionManager {
     #[builder(setter(into))]
     table_key_id: String,
     /// All encryption keys from table metadata (KEKs and wrapped key metadata entries).
-    #[builder(default)]
+    #[builder(default, via_mutators)]
     encryption_keys: HashMap<String, EncryptedKey>,
 }
 
@@ -417,14 +427,14 @@ mod tests {
         let kek = new_kek.unwrap();
 
         // Build a manager with the KEK so we can unwrap
-        let mut encryption_keys = HashMap::new();
-        encryption_keys.insert(kek.key_id().to_string(), kek);
         let mgr = EncryptionManager::builder()
             .kms_client(kms)
             .table_key_id("master-1")
-            .encryption_keys(encryption_keys.clone())
+            .add_encryption_key(kek.clone())
             .build();
 
+        let mut encryption_keys = HashMap::new();
+        encryption_keys.insert(kek.key_id().to_string(), kek);
         let decrypted = mgr
             .unwrap_key_metadata(&entry, &encryption_keys)
             .await
@@ -445,12 +455,10 @@ mod tests {
         let kek = new_kek.unwrap();
 
         // Build manager with the active KEK (same KMS to unwrap)
-        let mut encryption_keys = HashMap::new();
-        encryption_keys.insert(kek.key_id().to_string(), kek.clone());
         let mgr = EncryptionManager::builder()
             .kms_client(kms)
             .table_key_id("master-1")
-            .encryption_keys(encryption_keys)
+            .add_encryption_key(kek.clone())
             .build();
 
         // Second wrap should reuse the existing KEK (no new KEK)
@@ -483,12 +491,10 @@ mod tests {
             .build();
 
         // Build manager with the expired KEK
-        let mut encryption_keys = HashMap::new();
-        encryption_keys.insert(old_kek.key_id().to_string(), old_kek.clone());
         let mgr = EncryptionManager::builder()
             .kms_client(kms)
             .table_key_id("master-1")
-            .encryption_keys(encryption_keys)
+            .add_encryption_key(old_kek.clone())
             .build();
 
         // Wrap should rotate to a new KEK since the existing one is expired
@@ -532,13 +538,14 @@ mod tests {
 
         // Create KEK (caches the plaintext KEK)
         let kek = mgr.create_kek().await.unwrap();
-        let mut encryption_keys = HashMap::new();
-        encryption_keys.insert(kek.key_id().to_string(), kek.clone());
         let mgr = EncryptionManager::builder()
             .kms_client(kms)
             .table_key_id("master-1")
-            .encryption_keys(encryption_keys.clone())
+            .add_encryption_key(kek.clone())
             .build();
+
+        let mut encryption_keys = HashMap::new();
+        encryption_keys.insert(kek.key_id().to_string(), kek);
 
         // Wrap key metadata (unwraps KEK -- should hit cache from create_kek)
         let (entry, _) = mgr.wrap_key_metadata(b"test-data").await.unwrap();
@@ -621,7 +628,6 @@ mod tests {
         let mgr = EncryptionManager::builder()
             .kms_client(kms)
             .table_key_id("master-1")
-            .encryption_keys(encryption_keys.clone())
             .build();
 
         let result = mgr.unwrap_key_metadata(&entry, &encryption_keys).await;
@@ -664,7 +670,6 @@ mod tests {
         let mgr = EncryptionManager::builder()
             .kms_client(kms)
             .table_key_id("master-1")
-            .encryption_keys(encryption_keys.clone())
             .build();
 
         // Unwrap should fail because the AAD (timestamp) doesn't match what was used to wrap
