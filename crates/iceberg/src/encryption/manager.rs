@@ -141,7 +141,8 @@ impl EncryptionManager {
     /// Returns a [`StandardKeyMetadata`] containing a fresh DEK and AAD prefix.
     /// The caller should pass this to the Parquet writer to configure
     /// `FileEncryptionProperties`, and serialize it for storage in the manifest.
-    pub fn generate_native_key_metadata(&self) -> Result<StandardKeyMetadata> {
+    #[allow(dead_code)]
+    pub(crate) fn generate_native_key_metadata(&self) -> Result<StandardKeyMetadata> {
         let dek = SecureKey::generate(self.key_size);
         let aad_prefix = Self::generate_aad_prefix();
         Ok(StandardKeyMetadata::new(dek.as_bytes()).with_aad_prefix(&aad_prefix))
