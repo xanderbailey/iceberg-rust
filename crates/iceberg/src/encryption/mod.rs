@@ -23,6 +23,7 @@
 mod crypto;
 pub(crate) mod io;
 pub(crate) mod key_metadata;
+mod keys;
 pub mod kms;
 mod manager;
 mod stream;

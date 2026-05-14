@@ -25,6 +25,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::ops::Deref;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -34,22 +35,14 @@ use chrono::Utc;
 use moka::future::Cache;
 use uuid::Uuid;
 
-const MILLIS_IN_DAY: i64 = 24 * 60 * 60 * 1000;
-
 use super::crypto::{AesGcmCipher, AesKeySize, SecureKey, SensitiveBytes};
 use super::io::EncryptedOutputFile;
 use super::key_metadata::StandardKeyMetadata;
+use super::keys::{KeyEncryptionKey, ManifestEncryptionKey};
 use super::kms::KeyManagementClient;
 use crate::io::OutputFile;
 use crate::spec::EncryptedKey;
 use crate::{Error, ErrorKind, Result};
-
-/// Property key for the KEK creation timestamp (milliseconds since epoch).
-/// Matches Java's `StandardEncryptionManager.KEY_TIMESTAMP`.
-pub const KEK_CREATED_AT_PROPERTY: &str = "KEY_TIMESTAMP";
-
-/// Default KEK lifespan in days, per NIST SP 800-57.
-const DEFAULT_KEK_LIFESPAN_DAYS: i64 = 730;
 
 /// Default cache TTL for unwrapped KEKs.
 const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(3600);
@@ -90,7 +83,7 @@ pub struct EncryptionManager {
     table_key_id: String,
     /// All encryption keys from table metadata (KEKs and wrapped key metadata entries).
     /// Newly created KEKs and wrapped manifest-list entries are inserted here so
-    /// callers can snapshot the full set at commit time via [`EncryptionManager::encryption_keys`].
+    /// callers can snapshot the full set at commit time via [`EncryptionManager::with_encryption_keys`].
     #[builder(default = RwLock::new(HashMap::new()), via_mutators)]
     encryption_keys: RwLock<HashMap<String, EncryptedKey>>,
 }
@@ -120,7 +113,7 @@ impl EncryptionManager {
     ///
     /// Stores the resulting wrapped entry (and any newly created KEK) in the
     /// manager's internal `encryption_keys` map. Callers persist the full set
-    /// at commit time via [`Self::encryption_keys`].
+    /// at commit time via [`Self::with_encryption_keys`].
     ///
     /// Returns the `key_id` of the wrapped entry, which should be recorded on
     /// the snapshot as `encryption_key_id` so readers can locate it later.
@@ -128,65 +121,38 @@ impl EncryptionManager {
         &self,
         key_metadata: &StandardKeyMetadata,
     ) -> Result<String> {
-        let kek = match self.find_active_kek()? {
+        let kek = match self.find_active_kek() {
             Some(existing) => existing,
             None => self.create_kek().await?,
         };
 
         let kek_bytes = self.unwrap_key_encryption_key(&kek).await?;
-
-        // Use the KEK timestamp as AAD to prevent timestamp tampering attacks.
-        let aad = Self::kek_timestamp_aad(&kek)?;
+        let aad = kek.timestamp_aad();
         let serialized = key_metadata.encode()?;
         let wrapped_metadata = self.wrap_dek_with_kek(&serialized, &kek_bytes, Some(aad))?;
 
-        let wrapped_key = EncryptedKey::builder()
-            .key_id(Uuid::new_v4().to_string())
-            .encrypted_key_metadata(wrapped_metadata)
-            .encrypted_by_id(kek.key_id())
-            .build();
-
-        let wrapped_key_id = wrapped_key.key_id().to_string();
-        self.insert_encryption_key(wrapped_key);
-        Ok(wrapped_key_id)
+        let entry =
+            ManifestEncryptionKey::new(Uuid::new_v4().to_string(), wrapped_metadata, kek.key_id());
+        let entry_id = entry.key_id().to_string();
+        self.insert_encryption_key(entry.into());
+        Ok(entry_id)
     }
 
     /// Decrypt a manifest list key metadata previously wrapped via
     /// [`Self::encrypt_manifest_list_key_metadata`].
     ///
     /// Looks up the entry by `encryption_key_id` (typically read from the
-    /// snapshot) in the manager's `encryption_keys` map.
+    /// snapshot) in the manager's `encryption_keys` map and parses it as a
+    /// [`ManifestEncryptionKey`] — yielding a clear error if it's actually
+    /// a KEK or otherwise malformed, rather than a generic crypto failure.
     pub async fn decrypt_manifest_list_key_metadata(
         &self,
         encryption_key_id: &str,
     ) -> Result<StandardKeyMetadata> {
-        let encrypted_key = self
-            .encryption_keys
-            .read()
-            .expect("encryption_keys lock poisoned")
-            .get(encryption_key_id)
-            .cloned()
-            .ok_or_else(|| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    format!("Encryption key '{encryption_key_id}' not found"),
-                )
-            })?;
-
-        let kek_key_id = encrypted_key.encrypted_by_id().ok_or_else(|| {
-            Error::new(
-                ErrorKind::DataInvalid,
-                format!(
-                    "EncryptedKey '{}' has no encrypted_by_id",
-                    encrypted_key.key_id()
-                ),
-            )
-        })?;
-
+        let entry = self.manifest_entry(encryption_key_id)?;
         let bytes = self
-            .decrypt_dek(kek_key_id, encrypted_key.encrypted_key_metadata())
+            .decrypt_dek(entry.kek_id(), entry.encrypted_key_metadata())
             .await?;
-
         StandardKeyMetadata::decode(bytes.as_bytes())
     }
 
@@ -210,9 +176,42 @@ impl EncryptionManager {
             .insert(key.key_id().to_string(), key);
     }
 
+    /// Look up `key_id` in the unified map and parse it as a KEK, validating
+    /// `encrypted_by_id == table_key_id`.
+    fn kek(&self, key_id: &str) -> Result<KeyEncryptionKey> {
+        let key = self
+            .encryption_keys
+            .read()
+            .expect("encryption_keys lock poisoned")
+            .get(key_id)
+            .cloned()
+            .ok_or_else(|| {
+                Error::new(ErrorKind::DataInvalid, format!("KEK not found: {key_id}"))
+            })?;
+        KeyEncryptionKey::try_from_encrypted_key(key, &self.table_key_id)
+    }
+
+    /// Look up `key_id` in the unified map and parse it as a manifest-list
+    /// entry. Fails if the id refers to a KEK or a malformed entry.
+    fn manifest_entry(&self, key_id: &str) -> Result<ManifestEncryptionKey> {
+        let key = self
+            .encryption_keys
+            .read()
+            .expect("encryption_keys lock poisoned")
+            .get(key_id)
+            .cloned()
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Manifest encryption key '{key_id}' not found"),
+                )
+            })?;
+        ManifestEncryptionKey::try_from_encrypted_key(key, &self.table_key_id)
+    }
+
     /// Create a new KEK, wrapped by the table's master key, and store it in
     /// the manager's `encryption_keys` map.
-    async fn create_kek(&self) -> Result<EncryptedKey> {
+    async fn create_kek(&self) -> Result<KeyEncryptionKey> {
         let (plaintext_kek, wrapped_kek) = if self.kms_client.supports_key_generation() {
             let result = self.kms_client.generate_key(&self.table_key_id).await?;
             (result.key().clone(), result.wrapped_key().to_vec())
@@ -229,75 +228,43 @@ impl EncryptionManager {
         let key_id = Uuid::new_v4().to_string();
         let now_ms = Utc::now().timestamp_millis();
 
-        let mut properties = HashMap::new();
-        properties.insert(KEK_CREATED_AT_PROPERTY.to_string(), now_ms.to_string());
-
         self.kek_cache.insert(key_id.clone(), plaintext_kek).await;
 
-        let kek = EncryptedKey::builder()
-            .key_id(key_id)
-            .encrypted_key_metadata(wrapped_kek)
-            .encrypted_by_id(&self.table_key_id)
-            .properties(properties)
-            .build();
-
-        self.insert_encryption_key(kek.clone());
+        let kek = KeyEncryptionKey::new(key_id, wrapped_kek, &self.table_key_id, now_ms);
+        self.insert_encryption_key(kek.deref().clone());
         Ok(kek)
     }
 
-    /// Check whether a KEK has exceeded its configured lifespan (730 days per NIST SP 800-57).
-    fn is_kek_expired(&self, kek: &EncryptedKey) -> bool {
-        let created_at_ms = match kek
-            .properties()
-            .get(KEK_CREATED_AT_PROPERTY)
-            .and_then(|ts| ts.parse::<i64>().ok())
-        {
-            Some(ts) => ts,
-            None => return true, // No timestamp -> treat as expired
-        };
-
-        let now_ms = Utc::now().timestamp_millis();
-        let lifespan_ms = DEFAULT_KEK_LIFESPAN_DAYS * MILLIS_IN_DAY;
-        (now_ms - created_at_ms) >= lifespan_ms
-    }
-
     /// Find the latest non-expired KEK for the table's master key.
-    fn find_active_kek(&self) -> Result<Option<EncryptedKey>> {
+    ///
+    /// Entries that don't validate as KEKs (manifest entries, or KEKs missing
+    /// `KEY_TIMESTAMP`) are skipped — `find_active_kek` is best-effort.
+    /// A subsequent decrypt that targets such an entry by id will surface the
+    /// validation error via [`Self::kek`].
+    fn find_active_kek(&self) -> Option<KeyEncryptionKey> {
         let keys = self
             .encryption_keys
             .read()
             .expect("encryption_keys lock poisoned");
-        Ok(keys
-            .values()
-            .filter(|kek| {
-                kek.encrypted_by_id()
-                    .map(|id| id == self.table_key_id)
-                    .unwrap_or(false)
-                    && !self.is_kek_expired(kek)
+        keys.values()
+            .filter_map(|key| {
+                KeyEncryptionKey::try_from_encrypted_key(key.clone(), &self.table_key_id).ok()
             })
-            .max_by_key(|kek| {
-                kek.properties()
-                    .get(KEK_CREATED_AT_PROPERTY)
-                    .and_then(|ts| ts.parse::<i64>().ok())
-                    .unwrap_or(0)
-            })
-            .cloned())
+            .filter(|kek| !kek.is_expired())
+            .max_by_key(KeyEncryptionKey::created_at_ms)
     }
 
     /// Unwrap a KEK using the KMS, with caching to avoid repeated calls.
-    async fn unwrap_key_encryption_key(&self, kek: &EncryptedKey) -> Result<SensitiveBytes> {
+    async fn unwrap_key_encryption_key(&self, kek: &KeyEncryptionKey) -> Result<SensitiveBytes> {
         let cache_key = kek.key_id().to_string();
 
         if let Some(cached) = self.kek_cache.get(&cache_key).await {
             return Ok(cached);
         }
 
-        let master_key_id = kek.encrypted_by_id().ok_or_else(|| {
-            Error::new(
-                ErrorKind::DataInvalid,
-                format!("KEK '{}' has no encrypted_by_id", kek.key_id()),
-            )
-        })?;
+        let master_key_id = kek
+            .encrypted_by_id()
+            .expect("KEK validation guarantees encrypted_by_id is set");
 
         let plaintext = self
             .kms_client
@@ -309,25 +276,10 @@ impl EncryptionManager {
         Ok(plaintext)
     }
 
-    /// Decrypt a wrapped DEK using the KEK identified by `kek_key_id`,
-    /// looked up in the manager's own `encryption_keys` map.
+    /// Decrypt a wrapped DEK using the KEK identified by `kek_key_id`.
     async fn decrypt_dek(&self, kek_key_id: &str, wrapped_dek: &[u8]) -> Result<SensitiveBytes> {
-        let kek = self
-            .encryption_keys
-            .read()
-            .expect("encryption_keys lock poisoned")
-            .get(kek_key_id)
-            .cloned()
-            .ok_or_else(|| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    format!("KEK not found in encryption keys: {kek_key_id}"),
-                )
-            })?;
-
-        // KEK timestamp as AAD prevents timestamp tampering.
-        let aad = Self::kek_timestamp_aad(&kek)?;
-
+        let kek = self.kek(kek_key_id)?;
+        let aad = kek.timestamp_aad();
         let kek_bytes = self.unwrap_key_encryption_key(&kek).await?;
         self.unwrap_dek_with_kek(wrapped_dek, &kek_bytes, Some(aad))
             .map_err(|e| {
@@ -336,23 +288,6 @@ impl EncryptionManager {
                     format!("Failed to unwrap key metadata with KEK '{kek_key_id}'"),
                 )
                 .with_source(e)
-            })
-    }
-
-    /// Extract the KEK timestamp for use as AAD. Returns an error if missing.
-    fn kek_timestamp_aad(kek: &EncryptedKey) -> Result<&[u8]> {
-        kek.properties()
-            .get(KEK_CREATED_AT_PROPERTY)
-            .map(|ts| ts.as_bytes())
-            .ok_or_else(|| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    format!(
-                        "KEK '{}' is missing required '{}' property",
-                        kek.key_id(),
-                        KEK_CREATED_AT_PROPERTY
-                    ),
-                )
             })
     }
 
@@ -392,7 +327,10 @@ impl EncryptionManager {
 mod tests {
     use super::*;
     use crate::encryption::EncryptedInputFile;
+    use crate::encryption::keys::KEK_CREATED_AT_PROPERTY;
     use crate::encryption::kms::MemoryKeyManagementClient;
+
+    const MILLIS_IN_DAY: i64 = 24 * 60 * 60 * 1000;
 
     fn create_test_kms() -> Arc<dyn KeyManagementClient> {
         let kms = MemoryKeyManagementClient::new();
@@ -515,16 +453,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_is_kek_expired_no_timestamp() {
-        let mgr = create_test_manager();
-
-        // KEK without a created-at timestamp -> treated as expired
-        let kek = EncryptedKey::builder()
+    async fn test_kek_validation_rejects_missing_timestamp() {
+        // KEK without KEY_TIMESTAMP fails to construct.
+        let key = EncryptedKey::builder()
             .key_id("no-ts")
             .encrypted_key_metadata(vec![0u8; 32])
+            .encrypted_by_id("master-1")
             .build();
+        let result = KeyEncryptionKey::try_from_encrypted_key(key, "master-1");
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains(KEK_CREATED_AT_PROPERTY)
+        );
+    }
 
-        assert!(mgr.is_kek_expired(&kek));
+    #[tokio::test]
+    async fn test_kek_validation_rejects_non_kek() {
+        // An entry encrypted by something other than the master key is not a KEK
+        let key = EncryptedKey::builder()
+            .key_id("not-a-kek")
+            .encrypted_key_metadata(vec![0u8; 32])
+            .encrypted_by_id("some-other-kek-id")
+            .build();
+        let result = KeyEncryptionKey::try_from_encrypted_key(key, "master-1");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_decrypt_rejects_kek_passed_as_manifest_entry() {
+        // If a caller passes a KEK id to decrypt_manifest_list_key_metadata,
+        // we should fail with a clear error rather than a generic crypto failure.
+        let mgr = create_test_manager();
+        let kek = mgr.create_kek().await.unwrap();
+        let result = mgr.decrypt_manifest_list_key_metadata(kek.key_id()).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.to_string().contains("not a manifest entry"),
+            "error should explain the misclassification: {err}"
+        );
     }
 
     #[tokio::test]
