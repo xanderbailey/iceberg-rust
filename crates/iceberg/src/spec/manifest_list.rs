@@ -29,6 +29,7 @@ use serde_derive::{Deserialize, Serialize};
 use self::_const_schema::{MANIFEST_LIST_AVRO_SCHEMA_V1, MANIFEST_LIST_AVRO_SCHEMA_V2};
 use self::_serde::{ManifestFileV1, ManifestFileV2};
 use super::{FormatVersion, Manifest};
+use crate::encryption::{EncryptedInputFile, StandardKeyMetadata};
 use crate::error::Result;
 use crate::io::{FileIO, OutputFile};
 use crate::spec::manifest_list::_const_schema::MANIFEST_LIST_AVRO_SCHEMA_V3;
@@ -846,7 +847,15 @@ impl ManifestFile {
     ///
     /// This method will also initialize inherited values of [`ManifestEntry`], such as `sequence_number`.
     pub async fn load_manifest(&self, file_io: &FileIO) -> Result<Manifest> {
-        let avro = file_io.new_input(&self.manifest_path)?.read().await?;
+        let avro = match &self.key_metadata {
+            Some(km) if !km.is_empty() => {
+                let input = file_io.new_input(&self.manifest_path)?;
+                let standard_key_metadata = StandardKeyMetadata::decode(km.as_slice())?;
+                let encrypted_input_file = EncryptedInputFile::new(input, standard_key_metadata);
+                encrypted_input_file.read().await?
+            }
+            _ => file_io.new_input(&self.manifest_path)?.read().await?,
+        };
 
         let (metadata, mut entries) = Manifest::try_from_avro_bytes(&avro)?;
 
@@ -1365,11 +1374,14 @@ mod test {
     use tempfile::TempDir;
 
     use super::_serde::ManifestListV2;
+    use crate::encryption::{EncryptedOutputFile, StandardKeyMetadata};
     use crate::io::FileIO;
     use crate::spec::manifest_list::_serde::{ManifestListV1, ManifestListV3};
     use crate::spec::{
-        Datum, FieldSummary, ManifestContentType, ManifestFile, ManifestList, ManifestListWriter,
-        UNASSIGNED_SEQUENCE_NUMBER,
+        DataContentType, DataFile, DataFileFormat, Datum, FieldSummary, ManifestContentType,
+        ManifestEntry, ManifestFile, ManifestList, ManifestListWriter, ManifestStatus,
+        ManifestWriterBuilder, NestedField, PartitionSpec, PrimitiveType, Schema as IcebergSchema,
+        Struct, Type, UNASSIGNED_SEQUENCE_NUMBER,
     };
 
     #[tokio::test]
@@ -2043,5 +2055,126 @@ mod test {
         assert_eq!(v2_manifest.deleted_rows_count, Some(0));
         assert_eq!(v2_manifest.partitions, None);
         assert_eq!(v2_manifest.key_metadata, None);
+    }
+
+    #[tokio::test]
+    async fn test_load_manifest_decrypts_encrypted_file() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        use bytes::Bytes;
+
+        let file_io = FileIO::new_with_fs();
+        let tmp_dir = TempDir::new().unwrap();
+
+        // Build a simple schema and partition spec
+        let schema = Arc::new(
+            IcebergSchema::builder()
+                .with_fields(vec![Arc::new(NestedField::optional(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Long),
+                ))])
+                .build()
+                .unwrap(),
+        );
+        let partition_spec = PartitionSpec::builder(schema.clone())
+            .with_spec_id(0)
+            .build()
+            .unwrap();
+
+        let entry = ManifestEntry {
+            status: ManifestStatus::Added,
+            snapshot_id: None,
+            sequence_number: None,
+            file_sequence_number: None,
+            data_file: DataFile {
+                content: DataContentType::Data,
+                file_path: "s3a://bucket/data/file.parquet".to_string(),
+                file_format: DataFileFormat::Parquet,
+                partition: Struct::empty(),
+                record_count: 10,
+                file_size_in_bytes: 1024,
+                column_sizes: HashMap::new(),
+                value_counts: HashMap::new(),
+                null_value_counts: HashMap::new(),
+                nan_value_counts: HashMap::new(),
+                lower_bounds: HashMap::new(),
+                upper_bounds: HashMap::new(),
+                key_metadata: None,
+                split_offsets: None,
+                equality_ids: None,
+                sort_order_id: None,
+                partition_spec_id: 0,
+                first_row_id: None,
+                referenced_data_file: None,
+                content_offset: None,
+                content_size_in_bytes: None,
+            },
+        };
+
+        // Step 1: Write manifest as plaintext avro to a temp file
+        let plaintext_path = tmp_dir.path().join("plain_manifest.avro");
+        let output_file = file_io
+            .new_output(plaintext_path.to_str().unwrap())
+            .unwrap();
+        let mut writer = ManifestWriterBuilder::new(
+            output_file,
+            Some(1),
+            None,
+            schema.clone(),
+            partition_spec.clone(),
+        )
+        .build_v3_data();
+        writer.add_entry(entry.clone()).unwrap();
+        writer.write_manifest_file().await.unwrap();
+
+        // Step 2: Read the plaintext avro bytes
+        let avro_bytes = fs::read(&plaintext_path).unwrap();
+
+        // Step 3: Encrypt those bytes and write to the target path
+        let encrypted_path = tmp_dir.path().join("encrypted_manifest.avro");
+        let key_metadata =
+            StandardKeyMetadata::new(b"0123456789abcdef").with_aad_prefix(b"test-aad");
+        let encrypted_output = EncryptedOutputFile::new(
+            file_io
+                .new_output(encrypted_path.to_str().unwrap())
+                .unwrap(),
+            key_metadata.clone(),
+        );
+        encrypted_output
+            .write(Bytes::from(avro_bytes))
+            .await
+            .unwrap();
+
+        // Step 4: Build a ManifestFile pointing to the encrypted file with encoded key_metadata
+        let encoded_km = key_metadata.encode().unwrap();
+        let manifest_file = ManifestFile {
+            manifest_path: encrypted_path.to_str().unwrap().to_string(),
+            manifest_length: 0,
+            partition_spec_id: 0,
+            content: ManifestContentType::Data,
+            sequence_number: 1,
+            min_sequence_number: 1,
+            added_snapshot_id: 1,
+            added_files_count: Some(1),
+            existing_files_count: Some(0),
+            deleted_files_count: Some(0),
+            added_rows_count: Some(10),
+            existing_rows_count: Some(0),
+            deleted_rows_count: Some(0),
+            partitions: Some(vec![]),
+            key_metadata: Some(encoded_km.to_vec()),
+            first_row_id: None,
+        };
+
+        // Step 5: load_manifest should decrypt and parse successfully
+        let manifest = manifest_file.load_manifest(&file_io).await.unwrap();
+        assert_eq!(manifest.entries().len(), 1);
+        assert_eq!(
+            manifest.entries()[0].file_path(),
+            "s3a://bucket/data/file.parquet"
+        );
+        assert_eq!(manifest.entries()[0].record_count(), 10);
     }
 }
