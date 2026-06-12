@@ -252,17 +252,32 @@ impl<'a> SnapshotProducer<'a> {
             DataFileFormat::Avro
         );
         let output_file = self.table.file_io().new_output(new_manifest_path)?;
-        let builder = ManifestWriterBuilder::new(
-            output_file,
-            Some(self.snapshot_id),
-            self.key_metadata.clone(),
-            self.table.metadata().current_schema().clone(),
-            self.table
-                .metadata()
-                .default_partition_spec()
-                .as_ref()
-                .clone(),
-        );
+        let schema = self.table.metadata().current_schema().clone();
+        let partition_spec = self
+            .table
+            .metadata()
+            .default_partition_spec()
+            .as_ref()
+            .clone();
+        let builder = if let Some(em) = self.table.encryption_manager() {
+            let encrypted_output = em.encrypt(output_file);
+            let key_metadata = encrypted_output.key_metadata().encode()?.into_vec();
+            ManifestWriterBuilder::new_from_encrypted(
+                encrypted_output,
+                Some(self.snapshot_id),
+                Some(key_metadata),
+                schema,
+                partition_spec,
+            )
+        } else {
+            ManifestWriterBuilder::new(
+                output_file,
+                Some(self.snapshot_id),
+                None,
+                schema,
+                partition_spec,
+            )
+        };
         match self.table.metadata().format_version() {
             FormatVersion::V1 => Ok(builder.build_v1()),
             FormatVersion::V2 => match content {
@@ -440,12 +455,20 @@ impl<'a> SnapshotProducer<'a> {
         let manifest_list_path = self.generate_manifest_list_file_path(0);
         let next_seq_num = self.table.metadata().next_sequence_number();
         let first_row_id = self.table.metadata().next_row_id();
-        let writer = self
+        let output_file = self
             .table
             .file_io()
-            .new_output(manifest_list_path.clone())?
-            .writer()
-            .await?;
+            .new_output(manifest_list_path.clone())?;
+
+        let (writer, manifest_list_key_metadata) = if let Some(em) = self.table.encryption_manager()
+        {
+            let encrypted_output = em.encrypt(output_file);
+            let key_metadata = encrypted_output.key_metadata().clone();
+            (encrypted_output.writer().await?, Some(key_metadata))
+        } else {
+            (output_file.writer().await?, None)
+        };
+
         let mut manifest_list_writer = match self.table.metadata().format_version() {
             FormatVersion::V1 => ManifestListWriter::v1(
                 writer,
@@ -482,6 +505,14 @@ impl<'a> SnapshotProducer<'a> {
         let writer_next_row_id = manifest_list_writer.next_row_id();
         manifest_list_writer.close().await?;
 
+        let encryption_key_id = if let (Some(em), Some(key_metadata)) =
+            (self.table.encryption_manager(), &manifest_list_key_metadata)
+        {
+            Some(em.encrypt_manifest_list_key_metadata(key_metadata).await?)
+        } else {
+            None
+        };
+
         let commit_ts = chrono::Utc::now().timestamp_millis();
         let new_snapshot = Snapshot::builder()
             .with_manifest_list(manifest_list_path)
@@ -490,7 +521,8 @@ impl<'a> SnapshotProducer<'a> {
             .with_sequence_number(next_seq_num)
             .with_summary(summary)
             .with_schema_id(self.table.metadata().current_schema_id())
-            .with_timestamp_ms(commit_ts);
+            .with_timestamp_ms(commit_ts)
+            .with_encryption_key_id(encryption_key_id);
 
         let new_snapshot = if let Some(writer_next_row_id) = writer_next_row_id {
             let assigned_rows = writer_next_row_id - self.table.metadata().next_row_id();
@@ -501,7 +533,7 @@ impl<'a> SnapshotProducer<'a> {
             new_snapshot.build()
         };
 
-        let updates = vec![
+        let mut updates = vec![
             TableUpdate::AddSnapshot {
                 snapshot: new_snapshot,
             },
@@ -513,6 +545,18 @@ impl<'a> SnapshotProducer<'a> {
                 ),
             },
         ];
+
+        if let Some(em) = self.table.encryption_manager() {
+            em.with_encryption_keys(|keys| {
+                for (key_id, key) in keys {
+                    if self.table.metadata().encryption_key(key_id).is_none() {
+                        updates.push(TableUpdate::AddEncryptionKey {
+                            encryption_key: key.clone(),
+                        });
+                    }
+                }
+            });
+        }
 
         let requirements = vec![
             TableRequirement::UuidMatch {
