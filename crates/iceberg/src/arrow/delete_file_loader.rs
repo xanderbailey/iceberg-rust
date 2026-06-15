@@ -24,6 +24,7 @@ use crate::arrow::ArrowReader;
 use crate::arrow::reader::ParquetReadOptions;
 use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
 use crate::arrow::scan_metrics::ScanMetrics;
+use crate::encryption::{FileKeyResolver, StandardFileKeyResolver};
 use crate::io::FileIO;
 use crate::scan::{ArrowRecordBatchStream, FileScanTaskDeleteFile};
 use crate::spec::{Schema, SchemaRef};
@@ -47,6 +48,7 @@ pub trait DeleteFileLoader {
 pub(crate) struct BasicDeleteFileLoader {
     file_io: FileIO,
     scan_metrics: ScanMetrics,
+    file_key_resolver: Arc<dyn FileKeyResolver>,
 }
 
 #[allow(unused_variables)]
@@ -55,11 +57,26 @@ impl BasicDeleteFileLoader {
         BasicDeleteFileLoader {
             file_io,
             scan_metrics,
+            file_key_resolver: Arc::new(StandardFileKeyResolver),
         }
+    }
+
+    /// Sets the [`FileKeyResolver`] used to resolve encrypted delete files'
+    /// `key_metadata`. Defaults to [`StandardFileKeyResolver`].
+    pub(crate) fn with_file_key_resolver(
+        mut self,
+        file_key_resolver: Arc<dyn FileKeyResolver>,
+    ) -> Self {
+        self.file_key_resolver = file_key_resolver;
+        self
     }
 
     pub(crate) fn file_io(&self) -> &FileIO {
         &self.file_io
+    }
+
+    pub(crate) fn file_key_resolver(&self) -> Arc<dyn FileKeyResolver> {
+        Arc::clone(&self.file_key_resolver)
     }
 
     /// Loads a RecordBatchStream for a given datafile.
@@ -82,6 +99,7 @@ impl BasicDeleteFileLoader {
             parquet_read_options,
             self.scan_metrics.bytes_read_counter(),
             key_metadata,
+            self.file_key_resolver.as_ref(),
         )
         .await?;
 

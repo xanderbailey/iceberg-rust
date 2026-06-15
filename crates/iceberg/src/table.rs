@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use crate::arrow::ArrowReaderBuilder;
-use crate::encryption::EncryptionManager;
+use crate::encryption::{EncryptionManager, FileKeyResolver};
 use crate::encryption::kms::KeyManagementClient;
 use crate::inspect::MetadataTable;
 use crate::io::FileIO;
@@ -273,6 +273,16 @@ impl Table {
     /// supplied to the [`TableBuilder`].
     pub fn encryption_manager(&self) -> Option<&EncryptionManager> {
         self.encryption_manager.as_deref()
+    }
+
+    /// Returns the table's [`EncryptionManager`] as a shared
+    /// [`FileKeyResolver`] for the read path, if encryption is configured.
+    ///
+    /// [`FileKeyResolver`]: crate::encryption::FileKeyResolver
+    pub(crate) fn file_key_resolver(&self) -> Option<Arc<dyn FileKeyResolver>> {
+        self.encryption_manager
+            .clone()
+            .map(|em| em as Arc<dyn FileKeyResolver>)
     }
 
     /// Creates a table scan.

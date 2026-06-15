@@ -27,6 +27,7 @@ use super::delete_filter::{DeleteFilter, PosDelLoadAction};
 use crate::arrow::delete_file_loader::BasicDeleteFileLoader;
 use crate::arrow::scan_metrics::ScanMetrics;
 use crate::arrow::{arrow_primitive_to_literal, arrow_schema_to_schema};
+use crate::encryption::FileKeyResolver;
 use crate::delete_vector::DeleteVector;
 use crate::expr::Predicate::AlwaysTrue;
 use crate::expr::{Predicate, Reference};
@@ -94,10 +95,26 @@ impl CachingDeleteFileLoader {
     }
 
     pub(crate) fn with_scan_metrics(mut self, scan_metrics: ScanMetrics) -> Self {
+        // Preserve the configured key resolver when rebuilding the inner loader
+        // with fresh scan metrics.
+        let file_key_resolver = self.basic_delete_file_loader.file_key_resolver();
         self.basic_delete_file_loader = BasicDeleteFileLoader::new(
             self.basic_delete_file_loader.file_io().clone(),
             scan_metrics,
-        );
+        )
+        .with_file_key_resolver(file_key_resolver);
+        self
+    }
+
+    /// Sets the [`FileKeyResolver`] used by the inner delete-file loader.
+    /// Defaults to [`StandardFileKeyResolver`].
+    pub(crate) fn with_file_key_resolver(
+        mut self,
+        file_key_resolver: Arc<dyn FileKeyResolver>,
+    ) -> Self {
+        self.basic_delete_file_loader = self
+            .basic_delete_file_loader
+            .with_file_key_resolver(file_key_resolver);
         self
     }
 

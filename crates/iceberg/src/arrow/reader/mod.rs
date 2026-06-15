@@ -17,7 +17,10 @@
 
 //! Parquet file data reader
 
+use std::sync::Arc;
+
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
+use crate::encryption::{FileKeyResolver, StandardFileKeyResolver};
 use crate::io::FileIO;
 use crate::runtime::Runtime;
 use crate::util::available_parallelism;
@@ -55,6 +58,7 @@ pub struct ArrowReaderBuilder {
     row_selection_enabled: bool,
     parquet_read_options: ParquetReadOptions,
     runtime: Runtime,
+    file_key_resolver: Arc<dyn FileKeyResolver>,
 }
 
 impl ArrowReaderBuilder {
@@ -70,7 +74,20 @@ impl ArrowReaderBuilder {
             row_selection_enabled: false,
             parquet_read_options: ParquetReadOptions::builder().build(),
             runtime,
+            file_key_resolver: Arc::new(StandardFileKeyResolver),
         }
+    }
+
+    /// Sets the [`FileKeyResolver`] used to turn per-file `key_metadata` into
+    /// decryption key material.
+    ///
+    /// Defaults to [`StandardFileKeyResolver`] (the standard encryption
+    /// scheme). Provide a custom resolver to support schemes whose
+    /// `key_metadata` is, e.g., a KMS-resolved key reference rather than an
+    /// embedded plaintext DEK.
+    pub fn with_file_key_resolver(mut self, resolver: Arc<dyn FileKeyResolver>) -> Self {
+        self.file_key_resolver = resolver;
+        self
     }
 
     /// Sets the max number of in flight data files that are being fetched
@@ -133,11 +150,13 @@ impl ArrowReaderBuilder {
                 self.file_io.clone(),
                 self.concurrency_limit_data_files,
                 self.runtime.clone(),
-            ),
+            )
+            .with_file_key_resolver(Arc::clone(&self.file_key_resolver)),
             concurrency_limit_data_files: self.concurrency_limit_data_files,
             row_group_filtering_enabled: self.row_group_filtering_enabled,
             row_selection_enabled: self.row_selection_enabled,
             parquet_read_options: self.parquet_read_options,
+            file_key_resolver: self.file_key_resolver,
         }
     }
 }
@@ -155,4 +174,5 @@ pub struct ArrowReader {
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
     parquet_read_options: ParquetReadOptions,
+    file_key_resolver: Arc<dyn FileKeyResolver>,
 }
