@@ -34,6 +34,7 @@ pub use task::*;
 use crate::arrow::ArrowReaderBuilder;
 pub use crate::arrow::{ScanMetrics, ScanResult};
 use crate::delete_file_index::DeleteFileIndex;
+use crate::encryption::FileKeyResolver;
 use crate::expr::visitors::inclusive_metrics_evaluator::InclusiveMetricsEvaluator;
 use crate::expr::{Bind, BoundPredicate, Predicate};
 use crate::io::FileIO;
@@ -212,6 +213,7 @@ impl<'a> TableScanBuilder<'a> {
                         row_group_filtering_enabled: self.row_group_filtering_enabled,
                         row_selection_enabled: self.row_selection_enabled,
                         runtime: self.table.runtime().clone(),
+                        file_key_resolver: self.table.file_key_resolver(),
                     });
                 };
                 current_snapshot_id.clone()
@@ -306,6 +308,7 @@ impl<'a> TableScanBuilder<'a> {
             row_group_filtering_enabled: self.row_group_filtering_enabled,
             row_selection_enabled: self.row_selection_enabled,
             runtime: self.table.runtime().clone(),
+            file_key_resolver: self.table.file_key_resolver(),
         })
     }
 }
@@ -336,6 +339,14 @@ pub struct TableScan {
     row_selection_enabled: bool,
 
     runtime: Runtime,
+
+    /// Resolver for per-file `key_metadata`, derived from the table's
+    /// [`EncryptionManager`]. `None` for unencrypted tables, in which case the
+    /// reader falls back to its default [`StandardFileKeyResolver`].
+    ///
+    /// [`EncryptionManager`]: crate::encryption::EncryptionManager
+    /// [`StandardFileKeyResolver`]: crate::encryption::StandardFileKeyResolver
+    file_key_resolver: Option<Arc<dyn FileKeyResolver>>,
 }
 
 impl TableScan {
@@ -470,6 +481,11 @@ impl TableScan {
 
         if let Some(batch_size) = self.batch_size {
             arrow_reader_builder = arrow_reader_builder.with_batch_size(batch_size);
+        }
+
+        if let Some(file_key_resolver) = &self.file_key_resolver {
+            arrow_reader_builder =
+                arrow_reader_builder.with_file_key_resolver(Arc::clone(file_key_resolver));
         }
 
         arrow_reader_builder

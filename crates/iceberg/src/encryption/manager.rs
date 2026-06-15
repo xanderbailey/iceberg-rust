@@ -36,10 +36,13 @@ use uuid::Uuid;
 
 const MILLIS_IN_DAY: i64 = 24 * 60 * 60 * 1000;
 
+use async_trait::async_trait;
+
 use super::crypto::{AesGcmCipher, AesKeySize, SecureKey, SensitiveBytes};
 use super::io::EncryptedOutputFile;
 use super::key_metadata::StandardKeyMetadata;
 use super::kms::KeyManagementClient;
+use super::resolver::FileKeyResolver;
 use crate::io::OutputFile;
 use crate::spec::{EncryptedKey, FormatVersion, TableMetadataRef};
 use crate::{Error, ErrorKind, Result};
@@ -426,6 +429,20 @@ impl EncryptionManager {
         let key = SecureKey::try_from(kek.clone())?;
         let cipher = AesGcmCipher::new(key);
         cipher.decrypt(wrapped_dek, aad).map(SensitiveBytes::new)
+    }
+}
+
+#[async_trait]
+impl FileKeyResolver for EncryptionManager {
+    /// Resolve per-file `key_metadata` for the standard encryption scheme.
+    ///
+    /// For data files the per-file DEK is stored in plaintext in field 131
+    /// (the KMS/KEK envelope work happened one tier up when the manifest-list
+    /// key metadata was decrypted), so this is a synchronous decode with no
+    /// KMS round-trip. A non-standard scheme would override this with an
+    /// implementation that performs the async unwrap here.
+    async fn resolve(&self, key_metadata: &[u8]) -> Result<StandardKeyMetadata> {
+        StandardKeyMetadata::decode(key_metadata)
     }
 }
 

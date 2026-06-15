@@ -25,6 +25,7 @@ pub(crate) mod io;
 pub(crate) mod key_metadata;
 pub mod kms;
 mod manager;
+mod resolver;
 mod stream;
 
 pub use crypto::{AesGcmCipher, AesKeySize, SecureKey, SensitiveBytes};
@@ -32,4 +33,5 @@ pub use io::{EncryptedInputFile, EncryptedOutputFile};
 pub use key_metadata::StandardKeyMetadata;
 pub use kms::{GeneratedKey, KeyManagementClient};
 pub use manager::EncryptionManager;
+pub use resolver::{FileKeyResolver, StandardFileKeyResolver};
 pub use stream::{AesGcmFileRead, AesGcmFileWrite};

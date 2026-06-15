@@ -36,7 +36,7 @@ use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
 use crate::arrow::int96::coerce_int96_timestamps;
 use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
 use crate::arrow::scan_metrics::{CountingFileRead, ScanMetrics, ScanResult};
-use crate::encryption::StandardKeyMetadata;
+use crate::encryption::FileKeyResolver;
 use crate::error::Result;
 use crate::io::{FileIO, FileMetadata, FileRead};
 use crate::metadata_columns::{RESERVED_FIELD_ID_FILE, is_metadata_field};
@@ -61,6 +61,7 @@ impl ArrowReader {
             row_selection_enabled: self.row_selection_enabled,
             parquet_read_options: self.parquet_read_options,
             scan_metrics: scan_metrics.clone(),
+            file_key_resolver: self.file_key_resolver,
         };
 
         // Fast-path for single concurrency to avoid overhead of try_flatten_unordered
@@ -102,6 +103,7 @@ struct FileScanTaskReader {
     row_selection_enabled: bool,
     parquet_read_options: ParquetReadOptions,
     scan_metrics: ScanMetrics,
+    file_key_resolver: Arc<dyn FileKeyResolver>,
 }
 
 impl FileScanTaskReader {
@@ -123,6 +125,7 @@ impl FileScanTaskReader {
             parquet_read_options,
             self.scan_metrics.bytes_read_counter(),
             task.key_metadata.as_deref(),
+            self.file_key_resolver.as_ref(),
         )
         .await?;
 
@@ -419,6 +422,7 @@ impl ArrowReader {
         parquet_read_options: ParquetReadOptions,
         bytes_read: &Arc<AtomicU64>,
         key_metadata: Option<&[u8]>,
+        file_key_resolver: &dyn FileKeyResolver,
     ) -> Result<(ArrowFileReader, ArrowReaderMetadata)> {
         let parquet_file = file_io.new_input(data_file_path)?;
         let counting_reader =
@@ -428,6 +432,7 @@ impl ArrowReader {
             file_size_in_bytes,
             parquet_read_options,
             key_metadata,
+            file_key_resolver,
         )
         .await
     }
@@ -437,6 +442,7 @@ impl ArrowReader {
         file_size_in_bytes: u64,
         parquet_read_options: ParquetReadOptions,
         key_metadata: Option<&[u8]>,
+        file_key_resolver: &dyn FileKeyResolver,
     ) -> Result<(ArrowFileReader, ArrowReaderMetadata)> {
         let mut reader = ArrowFileReader::new(
             FileMetadata {
@@ -446,7 +452,8 @@ impl ArrowReader {
         )
         .with_parquet_read_options(parquet_read_options);
 
-        let arrow_reader_options = Self::build_arrow_reader_options(key_metadata)?;
+        let arrow_reader_options =
+            Self::build_arrow_reader_options(key_metadata, file_key_resolver).await?;
 
         let arrow_metadata = ArrowReaderMetadata::load_async(&mut reader, arrow_reader_options)
             .await
@@ -459,10 +466,21 @@ impl ArrowReader {
 
     /// Builds `ArrowReaderOptions`, adding `FileDecryptionProperties` when
     /// key metadata is present for Parquet Modular Encryption.
-    fn build_arrow_reader_options(key_metadata: Option<&[u8]>) -> Result<ArrowReaderOptions> {
+    ///
+    /// The `key_metadata` blob is resolved into key material via the supplied
+    /// [`FileKeyResolver`]; the resulting [`StandardKeyMetadata`] (plaintext
+    /// DEK + optional AAD prefix) is then converted into Parquet
+    /// `FileDecryptionProperties` here — the only layer that knows about
+    /// Parquet modular encryption.
+    ///
+    /// [`StandardKeyMetadata`]: crate::encryption::StandardKeyMetadata
+    async fn build_arrow_reader_options(
+        key_metadata: Option<&[u8]>,
+        file_key_resolver: &dyn FileKeyResolver,
+    ) -> Result<ArrowReaderOptions> {
         match key_metadata {
             Some(km) => {
-                let standard_key_metadata = StandardKeyMetadata::decode(km)?;
+                let standard_key_metadata = file_key_resolver.resolve(km).await?;
                 let mut builder = FileDecryptionProperties::builder(
                     standard_key_metadata.encryption_key().as_bytes().to_vec(),
                 );
