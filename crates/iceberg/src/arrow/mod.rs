@@ -33,10 +33,13 @@ mod reader;
 pub mod record_batch_projector;
 pub(crate) mod record_batch_transformer;
 mod scan_metrics;
+/// UTC-equivalent timestamp timezone coercion for Arrow RecordBatches
+pub mod timestamp_tz;
 mod value;
 
 pub use reader::*;
 pub use scan_metrics::{ScanMetrics, ScanResult};
+pub use timestamp_tz::coerce_timestamp_tz_schema;
 pub use value::*;
 /// Partition value calculator for computing partition values
 pub mod partition_value_calculator;

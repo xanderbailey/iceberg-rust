@@ -21,8 +21,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::vec;
 
-use datafusion::arrow::array::{Array, StringArray, UInt64Array};
-use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+use datafusion::arrow::array::{
+    Array, Int32Array, RecordBatch, StringArray, TimestampMicrosecondArray, UInt64Array,
+};
+use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
+use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
 use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use expect_test::expect;
@@ -942,6 +945,89 @@ async fn test_insert_into_partitioned() -> Result<()> {
         file_io.exists(&clothing_path).await?,
         "Expected partition directory: {clothing_path}"
     );
+
+    Ok(())
+}
+
+/// Regression test: inserting a batch whose timestamp column is labelled "UTC" into a
+/// partitioned `timestamptz` table. The Iceberg spec normalizes timestamptz to a "+00:00"
+/// offset, so without up-front coercion the write fails — first at `project_with_partition`'s
+/// schema validation, and otherwise at the Parquet writer. This is the partitioned counterpart
+/// that the unpartitioned early-return path used to hide.
+#[tokio::test]
+async fn test_insert_into_partitioned_accepts_utc_timestamp() -> Result<()> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_utc_partitioned".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    // Partitioned table: identity partition on a timestamptz column.
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(2, "ts", Type::Primitive(PrimitiveType::Timestamptz)).into(),
+        ])
+        .build()?;
+    let partition_spec = UnboundPartitionSpec::builder()
+        .with_spec_id(0)
+        .add_partition_field(2, "ts", Transform::Identity)?
+        .build();
+    let creation = TableCreation::builder()
+        .name("utc_partitioned".to_string())
+        .location(temp_path())
+        .schema(schema)
+        .partition_spec(partition_spec)
+        .properties(HashMap::new())
+        .build();
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(Arc::new(iceberg_catalog)).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Source data carrying an explicit "UTC" timezone, as DataFusion emits it.
+    let source_schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
+    ]));
+    let batch = RecordBatch::try_new(source_schema.clone(), vec![
+        Arc::new(Int32Array::from(vec![1, 2])),
+        Arc::new(TimestampMicrosecondArray::from(vec![0_i64, 1_000_000]).with_timezone("UTC")),
+    ])
+    .unwrap();
+    let mem_table = Arc::new(MemTable::try_new(source_schema, vec![vec![batch]]).unwrap());
+    ctx.register_table("utc_source", mem_table).unwrap();
+
+    // This INSERT ... SELECT feeds "UTC" timestamps into the partitioned write path.
+    let df = ctx
+        .sql(
+            "INSERT INTO catalog.test_utc_partitioned.utc_partitioned \
+             SELECT id, ts FROM utc_source",
+        )
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    let rows_inserted = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    assert_eq!(rows_inserted.value(0), 2, "Expected 2 rows inserted");
+
+    // Read back to confirm the data landed and the column reads as "+00:00".
+    let batches = ctx
+        .sql("SELECT id FROM catalog.test_utc_partitioned.utc_partitioned ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 2, "Expected 2 rows read back");
 
     Ok(())
 }

@@ -49,6 +49,7 @@ use iceberg::{Catalog, Error, ErrorKind, NamespaceIdent, Result, TableIdent};
 use metadata_table::IcebergMetadataTableProvider;
 
 use crate::error::to_datafusion_error;
+use crate::physical_plan::coerce::CoerceSchemaExec;
 use crate::physical_plan::commit::IcebergCommitExec;
 use crate::physical_plan::project::project_with_partition;
 use crate::physical_plan::repartition::repartition;
@@ -170,6 +171,16 @@ impl TableProvider for IcebergTableProvider {
             .map_err(to_datafusion_error)?;
 
         let partition_spec = table.metadata().default_partition_spec();
+
+        // Step 0: Coerce input batches to the table's Arrow types (e.g. timestamp "UTC" ->
+        // "+00:00") before partition values are computed or data is written. This runs as an
+        // opaque node so it is not fused into the partition projection below.
+        let table_arrow_schema = Arc::new(
+            schema_to_arrow_schema(table.metadata().current_schema())
+                .map_err(to_datafusion_error)?,
+        );
+        let input = Arc::new(CoerceSchemaExec::try_new(input, table_arrow_schema)?)
+            as Arc<dyn ExecutionPlan>;
 
         // Step 1: Project partition values for partitioned tables
         let plan_with_partition = if !partition_spec.is_unpartitioned() {

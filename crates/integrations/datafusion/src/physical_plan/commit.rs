@@ -682,7 +682,8 @@ mod tests {
 IcebergCommitExec: table=test_namespace.test_table
   CoalescePartitionsExec
     IcebergWriteExec: table=test_namespace.test_table
-      DataSourceExec: partitions=3, partition_sizes=[1, 1, 1]";
+      CoerceSchemaExec
+        DataSourceExec: partitions=3, partition_sizes=[1, 1, 1]";
 
         assert_eq!(
             actual_plan.trim(),
