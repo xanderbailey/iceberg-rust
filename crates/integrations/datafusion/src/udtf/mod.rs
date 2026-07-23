@@ -15,19 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod catalog;
-pub use catalog::*;
+//! User-defined table functions (UDTFs) for Iceberg.
 
-mod error;
-pub use error::*;
+mod time_travel;
 
-pub mod physical_plan;
-mod schema;
-pub mod table;
-pub use table::table_provider_factory::IcebergTableProviderFactory;
-pub use table::*;
-
-pub mod udtf;
-pub use udtf::*;
-
-pub(crate) mod task_writer;
+pub use time_travel::IcebergSnapshotFunction;
