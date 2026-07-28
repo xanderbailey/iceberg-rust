@@ -210,6 +210,9 @@ pub struct Table {
 impl Table {
     /// Sets the [`Table`] metadata and returns an updated instance with the new metadata applied.
     pub(crate) fn with_metadata(mut self, metadata: TableMetadataRef) -> Self {
+        if let Some(encryption_manager) = &self.encryption_manager {
+            encryption_manager.with_table_metadata(&metadata);
+        }
         self.metadata = metadata;
         self
     }

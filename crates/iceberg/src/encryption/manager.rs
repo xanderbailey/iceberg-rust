@@ -146,6 +146,30 @@ impl EncryptionManager {
         Ok(Some(Arc::new(em)))
     }
 
+    /// Reconcile this manager with updated table metadata (e.g. after a commit).
+    ///
+    /// Merges the encryption keys from `metadata` into the manager's live map.
+    /// The merge is a union that preserves in-memory keys the new metadata does
+    /// not (yet) contain — newly created KEKs and wrapped manifest-list entries
+    /// added during writes are only persisted into `TableMetadata.encryption_keys`
+    /// at commit time, so a blind replace could drop keys still needed to decrypt
+    /// files this manager just wrote. Entries present in `metadata` take
+    /// precedence on `key_id` collision.
+    ///
+    /// `table_key_id` and `key_size` are intentionally left untouched:
+    /// `encryption.key-id` and `encryption.data-key-length` are immutable for the
+    /// life of a table per the Iceberg spec, so a metadata update cannot change
+    /// them.
+    pub(crate) fn with_table_metadata(&self, metadata: &TableMetadataRef) {
+        let mut keys = self
+            .encryption_keys
+            .write()
+            .expect("encryption_keys lock poisoned");
+        for (key_id, key) in &metadata.encryption_keys {
+            keys.insert(key_id.clone(), key.clone());
+        }
+    }
+
     /// Encrypt a file with AGS1 stream encryption.
     ///
     /// Returns an [`EncryptedOutputFile`] that transparently encrypts on
@@ -678,6 +702,43 @@ mod tests {
             result.is_err(),
             "tampered timestamp should cause decryption failure"
         );
+    }
+
+    #[tokio::test]
+    async fn test_with_table_metadata_merges_keys() {
+        let mgr = create_test_manager();
+
+        // Simulate a KEK created in-memory during writes that has not yet been
+        // persisted into any metadata (as would happen before/around a commit).
+        let local_kek = mgr.create_kek().await.unwrap();
+        let local_kek_id = local_kek.key_id().to_string();
+        assert_eq!(mgr.with_encryption_keys(|k| k.len()), 1);
+
+        // Reconcile with committed metadata that contains a different set of keys.
+        let metadata = v3_encryption_metadata();
+        let metadata_key_ids: Vec<String> = metadata.encryption_keys.keys().cloned().collect();
+        assert_eq!(metadata_key_ids.len(), 2);
+
+        mgr.with_table_metadata(&metadata);
+
+        // Union: the in-memory KEK is preserved and the metadata keys are added.
+        mgr.with_encryption_keys(|keys| {
+            assert_eq!(keys.len(), 3);
+            assert!(
+                keys.contains_key(&local_kek_id),
+                "in-memory KEK must not be dropped"
+            );
+            for id in &metadata_key_ids {
+                assert!(keys.contains_key(id), "metadata key {id} must be merged in");
+            }
+        });
+    }
+
+    fn v3_encryption_metadata() -> TableMetadataRef {
+        let json =
+            std::fs::read_to_string("testdata/table_metadata/TableMetadataV3ValidEncryption.json")
+                .unwrap();
+        Arc::new(serde_json::from_str(&json).unwrap())
     }
 
     #[tokio::test]
