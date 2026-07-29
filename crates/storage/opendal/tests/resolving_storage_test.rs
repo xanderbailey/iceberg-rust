@@ -32,7 +32,7 @@ mod tests {
         FileIOBuilder, S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_PATH_STYLE_ACCESS, S3_REGION,
         S3_SECRET_ACCESS_KEY,
     };
-    use iceberg_storage_opendal::OpenDalResolvingStorageFactory;
+    use iceberg_storage_opendal::OpenDalFactory;
     use iceberg_test_utils::{get_minio_endpoint, normalize_test_name_with_parts, set_up};
 
     fn get_resolving_file_io() -> iceberg::io::FileIO {
@@ -40,7 +40,7 @@ mod tests {
 
         let minio_endpoint = get_minio_endpoint();
 
-        FileIOBuilder::new(Arc::new(OpenDalResolvingStorageFactory::new()))
+        FileIOBuilder::new(Arc::new(OpenDalFactory::new()))
             .with_props(vec![
                 (S3_ENDPOINT, minio_endpoint),
                 (S3_ACCESS_KEY_ID, "admin".to_string()),

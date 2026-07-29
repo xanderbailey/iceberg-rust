@@ -24,7 +24,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use iceberg::encryption::kms::{KeyManagementClient, KmsClientFactory};
-use iceberg::io::{FileIO, FileIOBuilder, StorageFactory};
+use iceberg::io::{
+    CredentialRefresh, CredentialRefreshFactory, FileIO, FileIOBuilder, StorageFactory,
+};
 use iceberg::table::Table;
 use iceberg::{
     Catalog, CatalogBuilder, Error, ErrorKind, Namespace, NamespaceIdent, Result, Runtime,
@@ -35,6 +37,7 @@ use reqwest::header::{
     HeaderMap, HeaderName, HeaderValue, {self},
 };
 use reqwest::{Client, Method, StatusCode, Url};
+use serde::{Deserialize, Serialize};
 use tokio::sync::OnceCell;
 use typed_builder::TypedBuilder;
 
@@ -44,8 +47,9 @@ use crate::client::{
 use crate::endpoint::{Endpoint, V1_NAMESPACE_EXISTS, V1_TABLE_EXISTS};
 use crate::types::{
     CatalogConfig, CommitTableRequest, CommitTableResponse, CreateNamespaceRequest,
-    CreateTableRequest, ListNamespaceResponse, ListTablesResponse, LoadTableResult,
-    NamespaceResponse, RegisterTableRequest, RenameTableRequest, StorageCredential,
+    CreateTableRequest, ListNamespaceResponse, ListTablesResponse, LoadCredentialsResponse,
+    LoadTableResult, NamespaceResponse, RegisterTableRequest, RenameTableRequest,
+    StorageCredential,
 };
 
 /// REST catalog URI
@@ -164,7 +168,12 @@ impl RestCatalogBuilder {
 }
 
 /// Rest catalog configuration.
-#[derive(Clone, Debug, TypedBuilder)]
+///
+/// Derives `serde` so it can travel inside a [`VendedCredentialRefreshFactory`]
+/// as part of a serialized `FileIO` recipe. The custom reqwest [`Client`] override
+/// is `#[serde(skip)]`: it is not serializable, and an executor rebuilding from the
+/// recipe uses a default client (re-fetching tokens from the configured endpoints).
+#[derive(Clone, Debug, TypedBuilder, Serialize, Deserialize)]
 pub(crate) struct RestCatalogConfig {
     #[builder(default, setter(strip_option))]
     name: Option<String>,
@@ -178,6 +187,7 @@ pub(crate) struct RestCatalogConfig {
     props: HashMap<String, String>,
 
     #[builder(default)]
+    #[serde(skip)]
     client: Option<Client>,
 }
 
@@ -228,6 +238,16 @@ impl RestCatalogConfig {
             &table.namespace.to_url_string(),
             "tables",
             &table.name,
+        ])
+    }
+
+    fn credentials_endpoint(&self, table: &TableIdent) -> String {
+        self.url_prefixed(&[
+            "namespaces",
+            &table.namespace.to_url_string(),
+            "tables",
+            &table.name,
+            "credentials",
         ])
     }
 
@@ -358,13 +378,93 @@ impl RestCatalogConfig {
 
 #[derive(Debug)]
 struct RestContext {
-    client: HttpClient,
+    // `Arc` so the authenticated client (and its shared token state) can be handed
+    // to a long-lived credential-refresh hook stored in a table's `FileIO`.
+    client: Arc<HttpClient>,
     /// Runtime config is fetched from rest server and stored here.
     ///
     /// It's could be different from the user config.
     config: RestCatalogConfig,
     /// Capabilities the server advertises (see [`RestCatalog::supports_endpoint`]).
     endpoints: HashSet<Endpoint>,
+}
+
+/// Serializable recipe for a [`VendedCredentialRefresh`] hook.
+///
+/// Holds only serializable configuration — the catalog config (endpoints, OAuth
+/// credentials, headers) and the table's credentials endpoint — so it round-trips
+/// through serde as part of a `FileIO` recipe. [`build`](Self::build) reconstructs
+/// the [`HttpClient`] from that config, so a distributed executor re-establishes
+/// its own authenticated client and re-fetches tokens on demand.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VendedCredentialRefreshFactory {
+    config: RestCatalogConfig,
+    credentials_endpoint: String,
+}
+
+#[typetag::serde(name = "rest-vended-credentials")]
+impl CredentialRefreshFactory for VendedCredentialRefreshFactory {
+    fn build(&self) -> Result<Arc<dyn CredentialRefresh>> {
+        let disable_header_redaction = self.config.disable_header_redaction();
+        Ok(Arc::new(VendedCredentialRefresh {
+            client: Arc::new(HttpClient::new(&self.config)?),
+            credentials_endpoint: self.credentials_endpoint.clone(),
+            disable_header_redaction,
+        }))
+    }
+}
+
+/// Re-vends a table's storage credentials via the REST `loadCredentials`
+/// endpoint, so a table's [`FileIO`] can refresh credentials as they near expiry.
+///
+/// Built from a [`VendedCredentialRefreshFactory`]; holds a freshly constructed
+/// [`HttpClient`] that authenticates using the catalog config, so refresh requests
+/// carry the same auth and delegation headers as the original `load_table`.
+#[derive(Debug)]
+struct VendedCredentialRefresh {
+    client: Arc<HttpClient>,
+    credentials_endpoint: String,
+    disable_header_redaction: bool,
+}
+
+#[async_trait]
+impl CredentialRefresh for VendedCredentialRefresh {
+    async fn refresh(&self, prefix: &str) -> Result<HashMap<String, String>> {
+        let request = self
+            .client
+            .request(Method::GET, self.credentials_endpoint.clone())
+            .build()?;
+        let http_response = self.client.query_catalog(request).await?;
+
+        let response = match http_response.status() {
+            StatusCode::OK => {
+                deserialize_catalog_response::<LoadCredentialsResponse>(http_response).await?
+            }
+            _ => {
+                return Err(deserialize_unexpected_catalog_error(
+                    http_response,
+                    self.disable_header_redaction,
+                )
+                .await);
+            }
+        };
+
+        // Choose the longest prefix that still covers `prefix`, matching the
+        // routing done in `FileIO` (and the Iceberg spec's selection rule).
+        let best = response
+            .storage_credentials
+            .into_iter()
+            .filter(|cred| prefix.starts_with(&cred.prefix))
+            .max_by_key(|cred| cred.prefix.len());
+
+        match best {
+            Some(cred) => Ok(cred.config),
+            None => Err(Error::new(
+                ErrorKind::Unexpected,
+                format!("`loadCredentials` returned no credential covering prefix `{prefix}`"),
+            )),
+        }
+    }
 }
 
 /// Rest catalog implementation.
@@ -443,7 +543,7 @@ impl RestCatalog {
                     _ => crate::endpoint::DEFAULT_ENDPOINTS.clone(),
                 };
                 let config = self.user_config.clone().merge_with_config(catalog_config);
-                let client = client.update_with(&config)?;
+                let client = Arc::new(client.update_with(&config)?);
 
                 Ok(RestContext {
                     config,
@@ -510,6 +610,7 @@ impl RestCatalog {
         metadata_location: Option<&str>,
         extra_config: Option<HashMap<String, String>>,
         storage_credentials: Option<&[StorageCredential]>,
+        table_ident: Option<&TableIdent>,
     ) -> Result<FileIO> {
         let mut props = self.context().await?.config.props.clone();
         if let Some(config) = extra_config {
@@ -544,6 +645,24 @@ impl RestCatalog {
 
         let mut builder = FileIOBuilder::new(factory).with_props(props.clone());
 
+        // Enable lazy credential refresh only when we know the table (to build its
+        // credentials endpoint) and the server advertises `loadCredentials`. Built
+        // once and shared across every vended prefix below.
+        let refresh = match table_ident {
+            Some(ident)
+                if self
+                    .supports_endpoint(&crate::endpoint::V1_LOAD_CREDENTIALS)
+                    .await? =>
+            {
+                let context = self.context().await?;
+                Some(Arc::new(VendedCredentialRefreshFactory {
+                    config: context.config.clone(),
+                    credentials_endpoint: context.config.credentials_endpoint(ident),
+                }) as Arc<dyn CredentialRefreshFactory>)
+            }
+            _ => None,
+        };
+
         // Vended credentials are scoped per location prefix: give each its own
         // storage. Paths under no vended prefix fall back to the default `props`
         // above, which carry no credentials.
@@ -551,7 +670,15 @@ impl RestCatalog {
             for cred in creds {
                 let mut prefixed = props.clone();
                 prefixed.extend(cred.config.clone());
-                builder = builder.with_prefixed_props(cred.prefix.clone(), prefixed);
+                builder = match &refresh {
+                    // The prefix's storage re-vends credentials as they near expiry.
+                    Some(refresh) => builder.with_prefixed_props_refresh(
+                        cred.prefix.clone(),
+                        prefixed,
+                        refresh.clone(),
+                    ),
+                    None => builder.with_prefixed_props(cred.prefix.clone(), prefixed),
+                };
             }
         }
 
@@ -866,6 +993,7 @@ impl Catalog for RestCatalog {
                 Some(metadata_location),
                 Some(base_config),
                 response.storage_credentials.as_deref(),
+                Some(&table_ident),
             )
             .await?;
 
@@ -930,6 +1058,7 @@ impl Catalog for RestCatalog {
                 response.metadata_location.as_deref(),
                 Some(base_config),
                 response.storage_credentials.as_deref(),
+                Some(table_ident),
             )
             .await?;
 
@@ -1066,7 +1195,7 @@ impl Catalog for RestCatalog {
         ))?;
 
         let file_io = self
-            .load_file_io(Some(metadata_location), None, None)
+            .load_file_io(Some(metadata_location), None, None, None)
             .await?;
 
         let mut table_builder = Table::builder()
@@ -1144,7 +1273,7 @@ impl Catalog for RestCatalog {
         // The commit response carries no credentials, so build a plain FileIO;
         // the transaction layer reuses the credentialed one it already holds.
         let file_io = self
-            .load_file_io(Some(&response.metadata_location), None, None)
+            .load_file_io(Some(&response.metadata_location), None, None, None)
             .await?;
 
         let mut table_builder = Table::builder()
@@ -2739,6 +2868,105 @@ mod tests {
 
         config_mock.assert_async().await;
         load_table_mock.assert_async().await;
+    }
+
+    /// Config mock advertising the `loadCredentials` endpoint so credential
+    /// refresh is enabled for loaded tables.
+    async fn create_config_mock_with_credentials_endpoint(server: &mut ServerGuard) -> Mock {
+        server
+            .mock("GET", "/v1/config")
+            .with_status(200)
+            .with_body(
+                r#"{
+                "overrides": { "warehouse": "s3://iceberg-catalog" },
+                "defaults": {},
+                "endpoints": [
+                    "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}",
+                    "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}/credentials"
+                ]
+            }"#,
+            )
+            .create_async()
+            .await
+    }
+
+    #[tokio::test]
+    async fn test_load_table_refreshes_expiring_vended_credentials() {
+        let mut server = Server::new_async().await;
+
+        let config_mock = create_config_mock_with_credentials_endpoint(&mut server).await;
+
+        // The loaded table vends credentials that are already within the prefetch
+        // window (expires-at in the past), so the first storage op must refresh.
+        let load_table_mock = server
+            .mock("GET", "/v1/namespaces/ns1/tables/test1")
+            .match_header("x-iceberg-access-delegation", "vended-credentials")
+            .with_status(200)
+            .with_body_from_file(format!(
+                "{}/testdata/{}",
+                env!("CARGO_MANIFEST_DIR"),
+                "load_table_response_with_expiring_credentials.json"
+            ))
+            .create_async()
+            .await;
+
+        // The refresh hook calls the credentials endpoint and gets fresh creds.
+        let credentials_mock = server
+            .mock("GET", "/v1/namespaces/ns1/tables/test1/credentials")
+            .match_header("x-iceberg-access-delegation", "vended-credentials")
+            .with_status(200)
+            .with_body(
+                r#"{
+                "storage-credentials": [
+                    {
+                        "prefix": "s3://warehouse/database/table",
+                        "config": {
+                            "s3.access-key-id": "refreshed-key-id",
+                            "s3.secret-access-key": "refreshed-secret",
+                            "s3.session-token": "refreshed-token",
+                            "s3.session-token-expires-at-ms": "7258118400000"
+                        }
+                    }
+                ]
+            }"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let props = HashMap::from([(
+            "header.X-Iceberg-Access-Delegation".to_string(),
+            "vended-credentials".to_string(),
+        )]);
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder()
+                .uri(server.url())
+                .props(props)
+                .build(),
+            Some(Arc::new(LocalFsStorageFactory)),
+            Runtime::current(),
+            None,
+        );
+
+        let table = catalog
+            .load_table(&TableIdent::from_strs(["ns1", "test1"]).unwrap())
+            .await
+            .unwrap();
+
+        // A storage op under the vended prefix routes to the refreshing storage,
+        // whose expiring credentials trigger a `loadCredentials` call. The op
+        // itself succeeds (LocalFs treats the missing path as non-existent).
+        let exists = table
+            .file_io()
+            .exists("s3://warehouse/database/table/data/file.parquet")
+            .await
+            .unwrap();
+        assert!(!exists);
+
+        config_mock.assert_async().await;
+        load_table_mock.assert_async().await;
+        // The refresh endpoint was hit exactly once (fresh creds are far-future).
+        credentials_mock.assert_async().await;
     }
 
     #[tokio::test]

@@ -20,6 +20,7 @@
 mod config;
 mod local_fs;
 mod memory;
+mod refreshing;
 
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -30,6 +31,8 @@ pub use config::*;
 use futures::stream::BoxStream;
 pub use local_fs::{LocalFsStorage, LocalFsStorageFactory};
 pub use memory::{MemoryStorage, MemoryStorageFactory};
+pub(crate) use refreshing::RefreshingStorage;
+pub use refreshing::{CredentialRefresh, CredentialRefreshFactory};
 
 use super::{FileMetadata, FileRead, FileWrite, InputFile, OutputFile};
 use crate::Result;

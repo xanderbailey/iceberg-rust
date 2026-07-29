@@ -23,7 +23,8 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt, stream};
 
 use super::storage::{
-    LocalFsStorageFactory, MemoryStorageFactory, Storage, StorageConfig, StorageFactory,
+    CredentialRefreshFactory, LocalFsStorageFactory, MemoryStorageFactory, RefreshingStorage,
+    Storage, StorageConfig, StorageFactory,
 };
 use crate::Result;
 
@@ -74,10 +75,16 @@ pub struct FileIO {
 }
 
 /// A storage scoped to a location `prefix`, lazily built from its own config.
+///
+/// When `refresh` is set, the storage for this prefix is a [`RefreshingStorage`]
+/// that re-vends credentials as they approach expiry via a hook built from the
+/// factory. The [`OnceLock`] caches that wrapper; the wrapper holds its own
+/// mutable state and rebuilds the underlying storage in place.
 #[derive(Debug)]
 struct PrefixedStorage {
     prefix: String,
     config: StorageConfig,
+    refresh: Option<Arc<dyn CredentialRefreshFactory>>,
     storage: OnceLock<Arc<dyn Storage>>,
 }
 
@@ -119,7 +126,7 @@ impl FileIO {
         // spec's storage-credentials semantics (and Java's `S3FileIO`).
         for ps in self.prefixed.iter() {
             if path.starts_with(&ps.prefix) {
-                return Self::get_or_build(&ps.storage, &self.factory, &ps.config);
+                return self.get_or_build_prefixed(ps);
             }
         }
         Self::get_or_build(&self.storage, &self.factory, &self.config)
@@ -138,6 +145,29 @@ impl FileIO {
         // Another thread might have set it first; keep whatever ends up in the cell.
         let _ = cell.set(storage);
         Ok(cell.get().unwrap().clone())
+    }
+
+    /// Get the cached storage for a prefix, building it on first use. When the
+    /// prefix has a credential-refresh hook, the built storage is wrapped in a
+    /// [`RefreshingStorage`] that re-vends credentials as they approach expiry.
+    fn get_or_build_prefixed(&self, ps: &PrefixedStorage) -> Result<Arc<dyn Storage>> {
+        if let Some(storage) = ps.storage.get() {
+            return Ok(storage.clone());
+        }
+        let storage: Arc<dyn Storage> = match &ps.refresh {
+            Some(refresh) => Arc::new(RefreshingStorage::new(
+                ps.prefix.clone(),
+                self.factory.clone(),
+                // The initial (stale) credentials in this config are harmless: each
+                // refresh layers freshly vended props on top, overriding them.
+                ps.config.clone(),
+                refresh.clone(),
+            )?),
+            None => self.factory.build(&ps.config)?,
+        };
+        // Another thread might have set it first; keep whatever ends up in the cell.
+        let _ = ps.storage.set(storage);
+        Ok(ps.storage.get().unwrap().clone())
     }
 
     /// Deletes file.
@@ -252,8 +282,39 @@ pub struct FileIOBuilder {
     factory: Arc<dyn StorageFactory>,
     /// Storage configuration
     config: StorageConfig,
-    /// Per-location-prefix configs (prefix, config).
-    prefixed: Vec<(String, StorageConfig)>,
+    /// Per-location-prefix configs, each with an optional credential-refresh hook.
+    prefixed: Vec<PrefixedConfig>,
+}
+
+/// A per-prefix storage config staged in the builder, with an optional factory
+/// that re-vends credentials for that prefix.
+#[derive(Clone)]
+struct PrefixedConfig {
+    prefix: String,
+    config: StorageConfig,
+    refresh: Option<Arc<dyn CredentialRefreshFactory>>,
+}
+
+impl std::fmt::Debug for PrefixedConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PrefixedConfig")
+            .field("prefix", &self.prefix)
+            .field("config", &self.config)
+            .field("refresh", &self.refresh.is_some())
+            .finish()
+    }
+}
+
+/// Build a [`StorageConfig`] from an iterator of stringifiable key-value pairs.
+fn prefixed_config(
+    props: impl IntoIterator<Item = (impl ToString, impl ToString)>,
+) -> StorageConfig {
+    StorageConfig::from_props(
+        props
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+    )
 }
 
 impl FileIOBuilder {
@@ -290,13 +351,36 @@ impl FileIOBuilder {
         prefix: impl Into<String>,
         props: impl IntoIterator<Item = (impl ToString, impl ToString)>,
     ) -> Self {
-        let config = StorageConfig::from_props(
-            props
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
-        );
-        self.prefixed.push((prefix.into(), config));
+        self.prefixed.push(PrefixedConfig {
+            prefix: prefix.into(),
+            config: prefixed_config(props),
+            refresh: None,
+        });
+        self
+    }
+
+    /// Add a per-prefix storage config whose credentials are re-vended by a hook
+    /// built from `refresh` once they approach expiry.
+    ///
+    /// Behaves like [`with_prefixed_props`](Self::with_prefixed_props), but the
+    /// prefix's storage is wrapped so that when its credentials carry an
+    /// `s3.session-token-expires-at-ms` that is near or past, the next storage
+    /// operation re-vends via the hook and rebuilds the storage with the fresh
+    /// credentials. If `props` carry no expiry, no refresh is attempted.
+    ///
+    /// `refresh` is a serializable [`CredentialRefreshFactory`] rather than a live
+    /// hook, so the resulting [`FileIO`]'s storage can round-trip through serde.
+    pub fn with_prefixed_props_refresh(
+        mut self,
+        prefix: impl Into<String>,
+        props: impl IntoIterator<Item = (impl ToString, impl ToString)>,
+        refresh: Arc<dyn CredentialRefreshFactory>,
+    ) -> Self {
+        self.prefixed.push(PrefixedConfig {
+            prefix: prefix.into(),
+            config: prefixed_config(props),
+            refresh: Some(refresh),
+        });
         self
     }
 
@@ -310,9 +394,10 @@ impl FileIOBuilder {
         let mut prefixed: Vec<PrefixedStorage> = self
             .prefixed
             .into_iter()
-            .map(|(prefix, config)| PrefixedStorage {
-                prefix,
-                config,
+            .map(|pc| PrefixedStorage {
+                prefix: pc.prefix,
+                config: pc.config,
+                refresh: pc.refresh,
                 storage: OnceLock::new(),
             })
             .collect();
@@ -702,6 +787,80 @@ mod tests {
         assert!(Arc::ptr_eq(&prefixed_a, &prefixed_b));
         // ...and a prefix-matching path resolves to a distinct storage from the default.
         assert!(!Arc::ptr_eq(&default_a, &prefixed_a));
+    }
+
+    #[tokio::test]
+    async fn test_prefixed_props_refresh_rebuilds_on_expired_credentials() {
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::io::{CredentialRefresh, CredentialRefreshFactory};
+
+        // A hook shared with the factory it is built from, so the test can inspect
+        // how many times the storage re-vends credentials.
+        #[derive(Debug)]
+        struct CountingRefresh(Arc<AtomicUsize>);
+
+        #[async_trait::async_trait]
+        impl CredentialRefresh for CountingRefresh {
+            async fn refresh(&self, _prefix: &str) -> crate::Result<HashMap<String, String>> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                // Return a far-future expiry so a single refresh suffices.
+                let far_future = chrono::Utc::now().timestamp_millis() + 24 * 60 * 60 * 1000;
+                Ok(HashMap::from([(
+                    "s3.session-token-expires-at-ms".to_string(),
+                    far_future.to_string(),
+                )]))
+            }
+        }
+
+        // The factory hands out the shared-counter hook. Its serde impls are unused
+        // here (this test never serializes the FileIO), so they simply error.
+        #[derive(Debug)]
+        struct CountingRefreshFactory(Arc<AtomicUsize>);
+
+        impl serde::Serialize for CountingRefreshFactory {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("test double: not serializable"))
+            }
+        }
+
+        impl<'de> serde::Deserialize<'de> for CountingRefreshFactory {
+            fn deserialize<D: serde::Deserializer<'de>>(_: D) -> Result<Self, D::Error> {
+                Err(serde::de::Error::custom("test double: not serializable"))
+            }
+        }
+
+        #[typetag::serde(name = "counting-refresh-file-io-test")]
+        impl CredentialRefreshFactory for CountingRefreshFactory {
+            fn build(&self) -> crate::Result<Arc<dyn CredentialRefresh>> {
+                Ok(Arc::new(CountingRefresh(self.0.clone())))
+            }
+        }
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let refresh = Arc::new(CountingRefreshFactory(counter.clone()));
+        // Credentials already expired: the first storage op must refresh.
+        let expired = chrono::Utc::now().timestamp_millis() - 60_000;
+        let file_io = FileIOBuilder::new(Arc::new(MemoryStorageFactory))
+            .with_prefixed_props_refresh(
+                "memory://creds/",
+                [("s3.session-token-expires-at-ms", expired.to_string())],
+                refresh,
+            )
+            .build();
+
+        // Routing to the prefix yields the refreshing wrapper; the op drives a refresh.
+        file_io.exists("memory://creds/x.txt").await.unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        // Now fresh: subsequent ops on the prefix do not refresh again.
+        file_io.exists("memory://creds/y.txt").await.unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        // Paths outside the prefix use the default storage, never the refresh hook.
+        file_io.exists("memory://other/z.txt").await.unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

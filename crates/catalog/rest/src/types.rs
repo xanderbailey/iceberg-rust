@@ -246,6 +246,15 @@ pub struct StorageCredential {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
+/// Response from the `loadCredentials` endpoint: fresh vended credentials for a
+/// table, used to refresh credentials that are approaching expiry.
+pub struct LoadCredentialsResponse {
+    /// Storage credentials, one entry per location prefix.
+    pub storage_credentials: Vec<StorageCredential>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
 /// Request to create a new table in a namespace.
 ///
 /// If `stage_create` is false, the table is created immediately.

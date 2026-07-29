@@ -162,6 +162,7 @@ endpoints! {
     V1_LIST_TABLES => GET "/v1/{prefix}/namespaces/{namespace}/tables",
     V1_CREATE_TABLE => POST "/v1/{prefix}/namespaces/{namespace}/tables",
     V1_LOAD_TABLE => GET "/v1/{prefix}/namespaces/{namespace}/tables/{table}",
+    V1_LOAD_CREDENTIALS => GET "/v1/{prefix}/namespaces/{namespace}/tables/{table}/credentials",
     V1_UPDATE_TABLE => POST "/v1/{prefix}/namespaces/{namespace}/tables/{table}",
     V1_DELETE_TABLE => DELETE "/v1/{prefix}/namespaces/{namespace}/tables/{table}",
     V1_TABLE_EXISTS => HEAD "/v1/{prefix}/namespaces/{namespace}/tables/{table}",
