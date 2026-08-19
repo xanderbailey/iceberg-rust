@@ -803,7 +803,7 @@ mod tests {
         let error = OpenDalStorageFactory::Memory.build(&config).unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::DataInvalid);
-        assert!(error.message().contains(OPENDAL_IO_TIMEOUT_MS));
+        assert!(format!("{error}").contains(OPENDAL_IO_TIMEOUT_MS));
     }
 
     #[cfg(feature = "opendal-memory")]
