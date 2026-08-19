@@ -16,7 +16,7 @@
 // under the License.
 
 //! Resolving storage that auto-detects the scheme from a path and delegates
-//! to the appropriate [`OpenDalStorage`] variant.
+//! to the appropriate [`OpenDalBackend`] variant.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -35,7 +35,7 @@ use url::Url;
 
 #[cfg(feature = "opendal-s3")]
 use crate::s3::CustomAwsCredentialLoader;
-use crate::{ConfiguredOpenDalStorage, OpenDalStorage, OpenDalStorageSettings};
+use crate::{OpenDalBackend, OpenDalStorage, OpenDalStorageSettings};
 
 /// Schemes supported by OpenDalResolvingStorage
 pub const SCHEME_MEMORY: &str = "memory";
@@ -80,17 +80,17 @@ fn extract_scheme(path: &str) -> Result<&'static str> {
     parse_scheme(url.scheme())
 }
 
-/// Build an [`OpenDalStorage`] variant for the given scheme and config properties.
-fn build_storage_for_scheme(
+/// Build an [`OpenDalBackend`] variant for the given scheme and config properties.
+fn build_backend_for_scheme(
     scheme: &'static str,
     props: &HashMap<String, String>,
     #[cfg(feature = "opendal-s3")] customized_credential_load: &Option<CustomAwsCredentialLoader>,
-) -> Result<ConfiguredOpenDalStorage> {
-    let storage: Result<OpenDalStorage> = match scheme {
+) -> Result<OpenDalBackend> {
+    match scheme {
         #[cfg(feature = "opendal-s3")]
         "s3" => {
             let config = crate::s3::s3_config_parse(props.clone())?;
-            Ok(OpenDalStorage::S3 {
+            Ok(OpenDalBackend::S3 {
                 config: Arc::new(config),
                 customized_credential_load: customized_credential_load.clone(),
             })
@@ -98,32 +98,32 @@ fn build_storage_for_scheme(
         #[cfg(feature = "opendal-gcs")]
         "gcs" => {
             let config = crate::gcs::gcs_config_parse(props.clone())?;
-            Ok(OpenDalStorage::Gcs {
+            Ok(OpenDalBackend::Gcs {
                 config: Arc::new(config),
             })
         }
         #[cfg(feature = "opendal-oss")]
         "oss" => {
             let config = crate::oss::oss_config_parse(props.clone())?;
-            Ok(OpenDalStorage::Oss {
+            Ok(OpenDalBackend::Oss {
                 config: Arc::new(config),
             })
         }
         #[cfg(feature = "opendal-azdls")]
         "azdls" => {
             let config = crate::azdls::azdls_config_parse(props.clone())?;
-            Ok(OpenDalStorage::Azdls {
+            Ok(OpenDalBackend::Azdls {
                 config: Arc::new(config),
             })
         }
         #[cfg(feature = "opendal-fs")]
-        "file" => Ok(OpenDalStorage::LocalFs),
+        "file" => Ok(OpenDalBackend::LocalFs),
         #[cfg(feature = "opendal-memory")]
-        "memory" => Ok(OpenDalStorage::Memory(crate::memory::memory_config_build()?)),
+        "memory" => Ok(OpenDalBackend::Memory(crate::memory::memory_config_build()?)),
         #[cfg(feature = "opendal-hf")]
         "hf" => {
             let config = crate::hf::hf_config_parse(props.clone())?;
-            Ok(OpenDalStorage::Hf {
+            Ok(OpenDalBackend::Hf {
                 config: Arc::new(config),
             })
         }
@@ -131,18 +131,13 @@ fn build_storage_for_scheme(
             ErrorKind::FeatureUnsupported,
             format!("Unsupported storage scheme: {unsupported}"),
         )),
-    };
-
-    storage.and_then(|storage| {
-        let settings = OpenDalStorageSettings::from_props(props)?;
-        Ok(ConfiguredOpenDalStorage::new(storage, settings))
-    })
+    }
 }
 
 /// A resolving storage factory that creates [`OpenDalResolvingStorage`] instances.
 ///
 /// This factory accepts paths from any supported storage system and dynamically
-/// delegates operations to the appropriate [`OpenDalStorage`] variant based on
+/// delegates operations to the appropriate [`OpenDalBackend`] variant based on
 /// the path scheme.
 ///
 /// # Example
@@ -192,6 +187,9 @@ impl OpenDalResolvingStorageFactory {
 impl StorageFactory for OpenDalResolvingStorageFactory {
     fn build(&self, config: &StorageConfig) -> Result<Arc<dyn Storage>> {
         Ok(Arc::new(OpenDalResolvingStorage {
+            // Parsed here rather than per scheme so invalid values are reported
+            // when the storage is built, not on the first operation.
+            settings: OpenDalStorageSettings::from_props(config.props())?,
             props: config.props().clone(),
             storages: RwLock::new(HashMap::new()),
             #[cfg(feature = "opendal-s3")]
@@ -201,7 +199,7 @@ impl StorageFactory for OpenDalResolvingStorageFactory {
 }
 
 /// A resolving storage that auto-detects the scheme from a path and delegates
-/// to the appropriate [`OpenDalStorage`] variant.
+/// to the appropriate [`OpenDalBackend`] variant.
 ///
 /// Sub-storages are lazily created on first use for each scheme and cached
 /// for subsequent operations. Scheme aliases like `s3`/`s3a`/`s3n` map to
@@ -210,9 +208,12 @@ impl StorageFactory for OpenDalResolvingStorageFactory {
 pub struct OpenDalResolvingStorage {
     /// Configuration properties shared across all backends.
     props: HashMap<String, String>,
+    /// Timeout and retry settings shared across all backends.
+    #[serde(default)]
+    settings: OpenDalStorageSettings,
     /// Cache of canonical scheme to storage mappings.
     #[serde(skip, default)]
-    storages: RwLock<HashMap<&'static str, Arc<ConfiguredOpenDalStorage>>>,
+    storages: RwLock<HashMap<&'static str, Arc<OpenDalStorage>>>,
     /// Custom AWS credential loader for S3 storage.
     #[cfg(feature = "opendal-s3")]
     #[serde(skip)]
@@ -222,7 +223,7 @@ pub struct OpenDalResolvingStorage {
 impl OpenDalResolvingStorage {
     /// Resolve the storage for the given path by extracting the canonical scheme and
     /// returning the cached or newly-created [`OpenDalStorage`].
-    fn resolve(&self, path: &str) -> Result<Arc<ConfiguredOpenDalStorage>> {
+    fn resolve(&self, path: &str) -> Result<Arc<OpenDalStorage>> {
         let scheme = extract_scheme(path)?;
 
         // Fast path: check read lock first.
@@ -247,13 +248,16 @@ impl OpenDalResolvingStorage {
             return Ok(storage.clone());
         }
 
-        let storage = build_storage_for_scheme(
+        let backend = build_backend_for_scheme(
             scheme,
             &self.props,
             #[cfg(feature = "opendal-s3")]
             &self.customized_credential_load,
         )?;
-        let storage = Arc::new(storage);
+        let storage = Arc::new(OpenDalStorage {
+            backend,
+            settings: self.settings,
+        });
         cache.insert(scheme, storage.clone());
         Ok(storage)
     }
@@ -330,10 +334,38 @@ mod tests {
     fn empty_resolving_storage() -> OpenDalResolvingStorage {
         OpenDalResolvingStorage {
             props: HashMap::new(),
+            settings: OpenDalStorageSettings::default(),
             storages: RwLock::new(HashMap::new()),
             #[cfg(feature = "opendal-s3")]
             customized_credential_load: None,
         }
+    }
+
+    #[test]
+    fn test_factory_rejects_invalid_settings() {
+        let config = StorageConfig::new().with_prop(crate::OPENDAL_RETRY_FACTOR, "0.5");
+        let error = OpenDalResolvingStorageFactory::new()
+            .build(&config)
+            .unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(format!("{error}").contains(crate::OPENDAL_RETRY_FACTOR));
+    }
+
+    #[cfg(feature = "opendal-memory")]
+    #[test]
+    fn test_resolve_applies_settings_to_each_scheme() {
+        let props = HashMap::from([(crate::OPENDAL_RETRY_MAX_TIMES.to_string(), "7".to_string())]);
+        let storage = OpenDalResolvingStorage {
+            settings: OpenDalStorageSettings::from_props(&props).unwrap(),
+            props,
+            storages: RwLock::new(HashMap::new()),
+            #[cfg(feature = "opendal-s3")]
+            customized_credential_load: None,
+        };
+
+        let resolved = storage.resolve("memory:/file").unwrap();
+        assert_eq!(resolved.settings.retry_max_times, Some(7));
     }
 
     #[cfg(feature = "opendal-s3")]

@@ -107,7 +107,7 @@ pub use resolving::{OpenDalResolvingStorage, OpenDalResolvingStorageFactory};
 
 /// OpenDAL-based storage factory.
 ///
-/// Maps scheme to the corresponding OpenDalStorage storage variant.
+/// Maps scheme to the corresponding [`OpenDalBackend`] variant.
 /// Use this factory with `FileIOBuilder::new(factory)` to create FileIO instances.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum OpenDalStorageFactory {
@@ -142,32 +142,32 @@ pub enum OpenDalStorageFactory {
 impl StorageFactory for OpenDalStorageFactory {
     #[allow(unreachable_code, unused_variables)]
     fn build(&self, config: &StorageConfig) -> Result<Arc<dyn Storage>> {
-        let storage = match self {
+        let backend = match self {
             #[cfg(feature = "opendal-memory")]
-            OpenDalStorageFactory::Memory => OpenDalStorage::Memory(memory_config_build()?),
+            OpenDalStorageFactory::Memory => OpenDalBackend::Memory(memory_config_build()?),
             #[cfg(feature = "opendal-fs")]
-            OpenDalStorageFactory::Fs => OpenDalStorage::LocalFs,
+            OpenDalStorageFactory::Fs => OpenDalBackend::LocalFs,
             #[cfg(feature = "opendal-s3")]
             OpenDalStorageFactory::S3 {
                 customized_credential_load,
-            } => OpenDalStorage::S3 {
+            } => OpenDalBackend::S3 {
                 config: s3_config_parse(config.props().clone())?.into(),
                 customized_credential_load: customized_credential_load.clone(),
             },
             #[cfg(feature = "opendal-gcs")]
-            OpenDalStorageFactory::Gcs => OpenDalStorage::Gcs {
+            OpenDalStorageFactory::Gcs => OpenDalBackend::Gcs {
                 config: gcs_config_parse(config.props().clone())?.into(),
             },
             #[cfg(feature = "opendal-oss")]
-            OpenDalStorageFactory::Oss => OpenDalStorage::Oss {
+            OpenDalStorageFactory::Oss => OpenDalBackend::Oss {
                 config: oss_config_parse(config.props().clone())?.into(),
             },
             #[cfg(feature = "opendal-azdls")]
-            OpenDalStorageFactory::Azdls => OpenDalStorage::Azdls {
+            OpenDalStorageFactory::Azdls => OpenDalBackend::Azdls {
                 config: azdls_config_parse(config.props().clone())?.into(),
             },
             #[cfg(feature = "opendal-hf")]
-            OpenDalStorageFactory::Hf => OpenDalStorage::Hf {
+            OpenDalStorageFactory::Hf => OpenDalBackend::Hf {
                 config: hf_config_parse(config.props().clone())?.into(),
             },
             #[cfg(all(
@@ -187,8 +187,7 @@ impl StorageFactory for OpenDalStorageFactory {
             }
         };
 
-        let settings = OpenDalStorageSettings::from_props(config.props())?;
-        Ok(Arc::new(ConfiguredOpenDalStorage::new(storage, settings)))
+        Ok(Arc::new(OpenDalStorage::new(backend, config.props())?))
     }
 }
 
@@ -198,21 +197,75 @@ fn default_memory_operator() -> Operator {
     memory_config_build().expect("Failed to create default memory operator")
 }
 
+/// OpenDAL-based storage implementation.
+///
+/// Pairs an [`OpenDalBackend`] with the timeout and retry settings applied to
+/// every operator it creates. Build one from properties with
+/// [`OpenDalStorage::new`], or from a backend alone with `From` to use OpenDAL's
+/// default settings.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct ConfiguredOpenDalStorage {
-    storage: OpenDalStorage,
+pub struct OpenDalStorage {
+    backend: OpenDalBackend,
+    #[serde(default)]
     settings: OpenDalStorageSettings,
 }
 
-impl ConfiguredOpenDalStorage {
-    fn new(storage: OpenDalStorage, settings: OpenDalStorageSettings) -> Self {
-        Self { storage, settings }
+impl OpenDalStorage {
+    /// Creates a storage for `backend`, taking its timeout and retry settings
+    /// from `props`.
+    ///
+    /// Returns an error if any `opendal.*` property holds an invalid value.
+    pub fn new(backend: OpenDalBackend, props: &HashMap<String, String>) -> Result<Self> {
+        Ok(Self {
+            backend,
+            settings: OpenDalStorageSettings::from_props(props)?,
+        })
+    }
+
+    /// Creates operator from path.
+    ///
+    /// # Arguments
+    ///
+    /// * path: It should be *absolute* path starting with scheme string used to construct [`FileIO`](iceberg::io::FileIO).
+    ///
+    /// # Returns
+    ///
+    /// The return value consists of two parts:
+    ///
+    /// * An [`opendal::Operator`] instance used to operate on file.
+    /// * Relative path to the root uri of [`opendal::Operator`].
+    fn create_operator<'a>(&self, path: &'a impl AsRef<str>) -> Result<(Operator, &'a str)> {
+        let (operator, relative_path) = self.backend.create_operator(path)?;
+
+        // Apply observability/resilience layers. TimeoutLayer must be
+        // inside RetryLayer so each retry attempt is independently
+        // bounded — without a per-attempt timeout, a future parked on a
+        // silently dropped TCP connection never produces an `Err` and
+        // RetryLayer cannot retry, leaving the caller hung indefinitely.
+        // See: https://opendal.apache.org/docs/rust/opendal/layers/struct.TimeoutLayer.html
+        //
+        // Transient errors are common for object stores; we retry temporary
+        // failures with exponential backoff. The retry behavior also
+        // benefits non-object-store backends.
+        let operator = operator
+            .layer(self.settings.timeout_layer())
+            .layer(self.settings.retry_layer());
+        Ok((operator, relative_path))
     }
 }
 
-/// OpenDAL-based storage implementation.
+impl From<OpenDalBackend> for OpenDalStorage {
+    fn from(backend: OpenDalBackend) -> Self {
+        Self {
+            backend,
+            settings: OpenDalStorageSettings::default(),
+        }
+    }
+}
+
+/// A storage backend, identified by its OpenDAL service configuration.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum OpenDalStorage {
+pub enum OpenDalBackend {
     /// Memory storage variant.
     #[cfg(feature = "opendal-memory")]
     Memory(#[serde(skip, default = "self::default_memory_operator")] Operator),
@@ -266,37 +319,17 @@ pub enum OpenDalStorage {
     },
 }
 
-impl OpenDalStorage {
-    /// Creates operator from path.
+impl OpenDalBackend {
+    /// Creates an unlayered operator from path.
     ///
-    /// # Arguments
-    ///
-    /// * path: It should be *absolute* path starting with scheme string used to construct [`FileIO`](iceberg::io::FileIO).
-    ///
-    /// # Returns
-    ///
-    /// The return value consists of two parts:
-    ///
-    /// * An [`opendal::Operator`] instance used to operate on file.
-    /// * Relative path to the root uri of [`opendal::Operator`].
+    /// Callers go through [`OpenDalStorage::create_operator`], which applies the
+    /// configured timeout and retry layers.
     #[allow(unreachable_code, unused_variables)]
-    pub(crate) fn create_operator<'a>(
-        &self,
-        path: &'a impl AsRef<str>,
-    ) -> Result<(Operator, &'a str)> {
-        self.create_operator_with_settings(path, &OpenDalStorageSettings::default())
-    }
-
-    #[allow(unreachable_code, unused_variables)]
-    fn create_operator_with_settings<'a>(
-        &self,
-        path: &'a impl AsRef<str>,
-        settings: &OpenDalStorageSettings,
-    ) -> Result<(Operator, &'a str)> {
+    fn create_operator<'a>(&self, path: &'a impl AsRef<str>) -> Result<(Operator, &'a str)> {
         let path = path.as_ref();
         let (operator, relative_path): (Operator, &str) = match self {
             #[cfg(feature = "opendal-memory")]
-            OpenDalStorage::Memory(op) => {
+            OpenDalBackend::Memory(op) => {
                 if let Some(stripped) = path.strip_prefix("memory:/") {
                     (op.clone(), stripped)
                 } else {
@@ -304,7 +337,7 @@ impl OpenDalStorage {
                 }
             }
             #[cfg(feature = "opendal-fs")]
-            OpenDalStorage::LocalFs => {
+            OpenDalBackend::LocalFs => {
                 let op = fs_config_build()?;
                 if let Some(stripped) = path.strip_prefix("file:/") {
                     (op, stripped)
@@ -313,7 +346,7 @@ impl OpenDalStorage {
                 }
             }
             #[cfg(feature = "opendal-s3")]
-            OpenDalStorage::S3 {
+            OpenDalBackend::S3 {
                 config,
                 customized_credential_load,
             } => {
@@ -339,7 +372,7 @@ impl OpenDalStorage {
                 }
             }
             #[cfg(feature = "opendal-gcs")]
-            OpenDalStorage::Gcs { config } => {
+            OpenDalBackend::Gcs { config } => {
                 let operator = gcs_config_build(config, path)?;
                 let prefix = format!("gs://{}/", operator.info().name());
                 if path.starts_with(&prefix) {
@@ -352,7 +385,7 @@ impl OpenDalStorage {
                 }
             }
             #[cfg(feature = "opendal-oss")]
-            OpenDalStorage::Oss { config } => {
+            OpenDalBackend::Oss { config } => {
                 let op = oss_config_build(config, path)?;
                 let prefix = format!("oss://{}/", op.info().name());
                 if path.starts_with(&prefix) {
@@ -365,9 +398,9 @@ impl OpenDalStorage {
                 }
             }
             #[cfg(feature = "opendal-azdls")]
-            OpenDalStorage::Azdls { config } => azdls_create_operator(path, config)?,
+            OpenDalBackend::Azdls { config } => azdls_create_operator(path, config)?,
             #[cfg(feature = "opendal-hf")]
-            OpenDalStorage::Hf { config } => hf_config_build(config, path)?,
+            OpenDalBackend::Hf { config } => hf_config_build(config, path)?,
             #[cfg(all(
                 not(feature = "opendal-s3"),
                 not(feature = "opendal-fs"),
@@ -384,19 +417,6 @@ impl OpenDalStorage {
             }
         };
 
-        // Apply observability/resilience layers. TimeoutLayer must be
-        // inside RetryLayer so each retry attempt is independently
-        // bounded — without a per-attempt timeout, a future parked on a
-        // silently dropped TCP connection never produces an `Err` and
-        // RetryLayer cannot retry, leaving the caller hung indefinitely.
-        // See: https://opendal.apache.org/docs/rust/opendal/layers/struct.TimeoutLayer.html
-        //
-        // Transient errors are common for object stores; we retry temporary
-        // failures with exponential backoff. The retry behavior also
-        // benefits non-object-store backends.
-        let operator = operator
-            .layer(settings.timeout_layer())
-            .layer(settings.retry_layer());
         Ok((operator, relative_path))
     }
 
@@ -407,7 +427,7 @@ impl OpenDalStorage {
     fn batch_key_for_path(&self, path: &str) -> String {
         match self {
             #[cfg(feature = "opendal-hf")]
-            OpenDalStorage::Hf { .. } => hf_batch_key(path),
+            OpenDalBackend::Hf { .. } => hf_batch_key(path),
             _ => url::Url::parse(path)
                 .ok()
                 .and_then(|u| u.host_str().map(|s| s.to_string()))
@@ -424,11 +444,11 @@ impl OpenDalStorage {
     pub(crate) fn relativize_path<'a>(&self, path: &'a str) -> Result<&'a str> {
         match self {
             #[cfg(feature = "opendal-memory")]
-            OpenDalStorage::Memory(_) => Ok(path.strip_prefix("memory:/").unwrap_or(&path[1..])),
+            OpenDalBackend::Memory(_) => Ok(path.strip_prefix("memory:/").unwrap_or(&path[1..])),
             #[cfg(feature = "opendal-fs")]
-            OpenDalStorage::LocalFs => Ok(path.strip_prefix("file:/").unwrap_or(&path[1..])),
+            OpenDalBackend::LocalFs => Ok(path.strip_prefix("file:/").unwrap_or(&path[1..])),
             #[cfg(feature = "opendal-s3")]
-            OpenDalStorage::S3 { .. } => {
+            OpenDalBackend::S3 { .. } => {
                 let url = url::Url::parse(path)?;
                 let bucket = url.host_str().ok_or_else(|| {
                     Error::new(
@@ -447,7 +467,7 @@ impl OpenDalStorage {
                 }
             }
             #[cfg(feature = "opendal-gcs")]
-            OpenDalStorage::Gcs { .. } => {
+            OpenDalBackend::Gcs { .. } => {
                 let url = url::Url::parse(path)?;
                 let bucket = url.host_str().ok_or_else(|| {
                     Error::new(
@@ -466,7 +486,7 @@ impl OpenDalStorage {
                 }
             }
             #[cfg(feature = "opendal-oss")]
-            OpenDalStorage::Oss { .. } => {
+            OpenDalBackend::Oss { .. } => {
                 let url = url::Url::parse(path)?;
                 let bucket = url.host_str().ok_or_else(|| {
                     Error::new(
@@ -485,14 +505,14 @@ impl OpenDalStorage {
                 }
             }
             #[cfg(feature = "opendal-azdls")]
-            OpenDalStorage::Azdls { config } => {
+            OpenDalBackend::Azdls { config } => {
                 let azure_path = path.parse::<AzureStoragePath>()?;
                 match_path_with_config(&azure_path, config)?;
                 let relative_path_len = azure_path.path.len();
                 Ok(&path[path.len() - relative_path_len..])
             }
             #[cfg(feature = "opendal-hf")]
-            OpenDalStorage::Hf { .. } => {
+            OpenDalBackend::Hf { .. } => {
                 let parsed = HfUri::parse(path).ok_or_else(|| {
                     Error::new(ErrorKind::DataInvalid, format!("Invalid hf url: {path}"))
                 })?;
@@ -584,141 +604,15 @@ impl Storage for OpenDalStorage {
         let mut deleters: HashMap<String, opendal::Deleter> = HashMap::new();
 
         while let Some(path) = paths.next().await {
-            let bucket = self.batch_key_for_path(&path);
-
-            let (relative_path, deleter) = match deleters.entry(bucket) {
-                Entry::Occupied(entry) => {
-                    (self.relativize_path(&path)?.to_string(), entry.into_mut())
-                }
-                Entry::Vacant(entry) => {
-                    let (op, rel) = self.create_operator(&path)?;
-                    let rel = rel.to_string();
-                    let deleter = op.deleter().await.map_err(from_opendal_error)?;
-                    (rel, entry.insert(deleter))
-                }
-            };
-
-            deleter
-                .delete(relative_path)
-                .await
-                .map_err(from_opendal_error)?;
-        }
-
-        for (_, mut deleter) in deleters {
-            deleter.close().await.map_err(from_opendal_error)?;
-        }
-
-        Ok(())
-    }
-
-    #[allow(unreachable_code, unused_variables)]
-    fn new_input(&self, path: &str) -> Result<InputFile> {
-        Ok(InputFile::new(Arc::new(self.clone()), path.to_string()))
-    }
-
-    #[allow(unreachable_code, unused_variables)]
-    fn new_output(&self, path: &str) -> Result<OutputFile> {
-        Ok(OutputFile::new(Arc::new(self.clone()), path.to_string()))
-    }
-}
-
-#[typetag::serde(name = "ConfiguredOpenDalStorage")]
-#[async_trait]
-impl Storage for ConfiguredOpenDalStorage {
-    async fn exists(&self, path: &str) -> Result<bool> {
-        let (op, relative_path) = self
-            .storage
-            .create_operator_with_settings(&path, &self.settings)?;
-        Ok(op.exists(relative_path).await.map_err(from_opendal_error)?)
-    }
-
-    async fn metadata(&self, path: &str) -> Result<FileMetadata> {
-        let (op, relative_path) = self
-            .storage
-            .create_operator_with_settings(&path, &self.settings)?;
-        let meta = op.stat(relative_path).await.map_err(from_opendal_error)?;
-        Ok(FileMetadata {
-            size: meta.content_length(),
-        })
-    }
-
-    async fn read(&self, path: &str) -> Result<Bytes> {
-        let (op, relative_path) = self
-            .storage
-            .create_operator_with_settings(&path, &self.settings)?;
-        Ok(op
-            .read(relative_path)
-            .await
-            .map_err(from_opendal_error)?
-            .to_bytes())
-    }
-
-    async fn reader(&self, path: &str) -> Result<Box<dyn FileRead>> {
-        let (op, relative_path) = self
-            .storage
-            .create_operator_with_settings(&path, &self.settings)?;
-        Ok(Box::new(OpenDalReader(
-            op.reader(relative_path).await.map_err(from_opendal_error)?,
-        )))
-    }
-
-    async fn write(&self, path: &str, bs: Bytes) -> Result<()> {
-        let (op, relative_path) = self
-            .storage
-            .create_operator_with_settings(&path, &self.settings)?;
-        op.write(relative_path, bs)
-            .await
-            .map_err(from_opendal_error)?;
-        Ok(())
-    }
-
-    async fn writer(&self, path: &str) -> Result<Box<dyn FileWrite>> {
-        let (op, relative_path) = self
-            .storage
-            .create_operator_with_settings(&path, &self.settings)?;
-        Ok(Box::new(OpenDalWriter(
-            op.writer(relative_path).await.map_err(from_opendal_error)?,
-        )))
-    }
-
-    async fn delete(&self, path: &str) -> Result<()> {
-        let (op, relative_path) = self
-            .storage
-            .create_operator_with_settings(&path, &self.settings)?;
-        Ok(op.delete(relative_path).await.map_err(from_opendal_error)?)
-    }
-
-    async fn delete_prefix(&self, path: &str) -> Result<()> {
-        let (op, relative_path) = self
-            .storage
-            .create_operator_with_settings(&path, &self.settings)?;
-        let path = if relative_path.ends_with('/') {
-            relative_path.to_string()
-        } else {
-            format!("{relative_path}/")
-        };
-        Ok(op
-            .delete_with(&path)
-            .recursive(true)
-            .await
-            .map_err(from_opendal_error)?)
-    }
-
-    async fn delete_stream(&self, mut paths: BoxStream<'static, String>) -> Result<()> {
-        let mut deleters: HashMap<String, opendal::Deleter> = HashMap::new();
-
-        while let Some(path) = paths.next().await {
-            let bucket = self.storage.batch_key_for_path(&path);
+            let bucket = self.backend.batch_key_for_path(&path);
 
             let (relative_path, deleter) = match deleters.entry(bucket) {
                 Entry::Occupied(entry) => (
-                    self.storage.relativize_path(&path)?.to_string(),
+                    self.backend.relativize_path(&path)?.to_string(),
                     entry.into_mut(),
                 ),
                 Entry::Vacant(entry) => {
-                    let (op, rel) = self
-                        .storage
-                        .create_operator_with_settings(&path, &self.settings)?;
+                    let (op, rel) = self.create_operator(&path)?;
                     let rel = rel.to_string();
                     let deleter = op.deleter().await.map_err(from_opendal_error)?;
                     (rel, entry.insert(deleter))
@@ -808,8 +702,56 @@ mod tests {
 
     #[cfg(feature = "opendal-memory")]
     #[test]
+    fn test_backend_conversion_uses_default_settings() {
+        let storage: OpenDalStorage = OpenDalBackend::Memory(default_memory_operator()).into();
+
+        assert_eq!(storage.settings, OpenDalStorageSettings::default());
+    }
+
+    #[cfg(feature = "opendal-memory")]
+    #[test]
+    fn test_storage_serde_round_trip_keeps_settings() {
+        let config = StorageConfig::new()
+            .with_prop(OPENDAL_IO_TIMEOUT_MS, "1500")
+            .with_prop(OPENDAL_RETRY_MAX_TIMES, "9");
+        let storage = OpenDalStorageFactory::Memory.build(&config).unwrap();
+
+        // Settings must survive the trip: a `dyn Storage` sent to another
+        // process should keep the timeouts it was built with, under the same
+        // type tag older readers expect.
+        let json = serde_json::to_string(&storage).unwrap();
+        assert!(json.contains(r#""type":"OpenDalStorage""#), "{json}");
+
+        let restored: Arc<dyn Storage> = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&restored).unwrap(), json);
+    }
+
+    #[cfg(feature = "opendal-memory")]
+    #[tokio::test]
+    async fn test_configured_storage_reads_and_writes() {
+        let config = StorageConfig::new()
+            .with_prop(OPENDAL_TIMEOUT_MS, "30000")
+            .with_prop(OPENDAL_IO_TIMEOUT_MS, "15000")
+            .with_prop(OPENDAL_RETRY_MAX_TIMES, "2")
+            .with_prop(OPENDAL_RETRY_MIN_DELAY_MS, "10")
+            .with_prop(OPENDAL_RETRY_MAX_DELAY_MS, "20")
+            .with_prop(OPENDAL_RETRY_FACTOR, "1.5")
+            .with_prop(OPENDAL_RETRY_JITTER, "true");
+        let storage = OpenDalStorageFactory::Memory.build(&config).unwrap();
+
+        storage
+            .write("memory:/a/b.txt", Bytes::from_static(b"data"))
+            .await
+            .unwrap();
+
+        assert!(storage.exists("memory:/a/b.txt").await.unwrap());
+        assert_eq!(storage.read("memory:/a/b.txt").await.unwrap(), "data");
+    }
+
+    #[cfg(feature = "opendal-memory")]
+    #[test]
     fn test_relativize_path_memory() {
-        let storage = OpenDalStorage::Memory(default_memory_operator());
+        let storage = OpenDalBackend::Memory(default_memory_operator());
 
         assert_eq!(
             storage.relativize_path("memory:/path/to/file").unwrap(),
@@ -825,7 +767,7 @@ mod tests {
     #[cfg(feature = "opendal-fs")]
     #[test]
     fn test_relativize_path_fs() {
-        let storage = OpenDalStorage::LocalFs;
+        let storage = OpenDalBackend::LocalFs;
 
         assert_eq!(
             storage
@@ -842,7 +784,7 @@ mod tests {
     #[cfg(feature = "opendal-s3")]
     #[test]
     fn test_relativize_path_s3() {
-        let storage = OpenDalStorage::S3 {
+        let storage = OpenDalBackend::S3 {
             config: Arc::new(S3Config::default()),
             customized_credential_load: None,
         };
@@ -863,7 +805,7 @@ mod tests {
     #[cfg(feature = "opendal-gcs")]
     #[test]
     fn test_relativize_path_gcs() {
-        let storage = OpenDalStorage::Gcs {
+        let storage = OpenDalBackend::Gcs {
             config: Arc::new(GcsConfig::default()),
         };
 
@@ -878,7 +820,7 @@ mod tests {
     #[cfg(feature = "opendal-gcs")]
     #[test]
     fn test_relativize_path_gcs_invalid_scheme() {
-        let storage = OpenDalStorage::Gcs {
+        let storage = OpenDalBackend::Gcs {
             config: Arc::new(GcsConfig::default()),
         };
 
@@ -892,7 +834,7 @@ mod tests {
     #[cfg(feature = "opendal-oss")]
     #[test]
     fn test_relativize_path_oss() {
-        let storage = OpenDalStorage::Oss {
+        let storage = OpenDalBackend::Oss {
             config: Arc::new(OssConfig::default()),
         };
 
@@ -907,7 +849,7 @@ mod tests {
     #[cfg(feature = "opendal-oss")]
     #[test]
     fn test_relativize_path_oss_invalid_scheme() {
-        let storage = OpenDalStorage::Oss {
+        let storage = OpenDalBackend::Oss {
             config: Arc::new(OssConfig::default()),
         };
 
@@ -921,7 +863,7 @@ mod tests {
     #[cfg(feature = "opendal-azdls")]
     #[test]
     fn test_relativize_path_azdls() {
-        let storage = OpenDalStorage::Azdls {
+        let storage = OpenDalBackend::Azdls {
             config: Arc::new(AzdlsConfig {
                 account_name: Some("myaccount".to_string()),
                 endpoint: Some("https://myaccount.dfs.core.windows.net".to_string()),

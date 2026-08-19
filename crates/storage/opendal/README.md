@@ -99,7 +99,10 @@ storage backend. Omitted properties retain OpenDAL's defaults.
 | `opendal.retry.min-delay-ms` | Minimum retry delay |
 | `opendal.retry.max-delay-ms` | Maximum retry delay |
 | `opendal.retry.factor` | Exponential backoff factor |
-| `opendal.retry.jitter` | Whether retry jitter is enabled |
+| `opendal.retry.jitter` | Whether retry jitter is enabled (off by default) |
+
+An invalid value is rejected when the storage is built. Keys outside this table
+are ignored, so a misspelled property silently has no effect.
 
 ```rust
 let file_io = FileIOBuilder::new(Arc::new(OpenDalStorageFactory::S3 {
@@ -107,5 +110,8 @@ let file_io = FileIOBuilder::new(Arc::new(OpenDalStorageFactory::S3 {
 }))
 .with_prop("opendal.io-timeout-ms", "120000")
 .with_prop("opendal.retry.max-times", "5")
-.build();
+.build()?;
 ```
+
+The same settings apply when a storage is constructed directly, via
+`OpenDalStorage::new(backend, &props)`.
