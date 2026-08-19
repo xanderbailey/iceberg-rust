@@ -33,9 +33,9 @@ use iceberg::{Error, ErrorKind, Result};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::OpenDalStorage;
 #[cfg(feature = "opendal-s3")]
 use crate::s3::CustomAwsCredentialLoader;
+use crate::{ConfiguredOpenDalStorage, OpenDalStorage, OpenDalStorageSettings};
 
 /// Schemes supported by OpenDalResolvingStorage
 pub const SCHEME_MEMORY: &str = "memory";
@@ -85,8 +85,8 @@ fn build_storage_for_scheme(
     scheme: &'static str,
     props: &HashMap<String, String>,
     #[cfg(feature = "opendal-s3")] customized_credential_load: &Option<CustomAwsCredentialLoader>,
-) -> Result<OpenDalStorage> {
-    match scheme {
+) -> Result<ConfiguredOpenDalStorage> {
+    let storage: Result<OpenDalStorage> = match scheme {
         #[cfg(feature = "opendal-s3")]
         "s3" => {
             let config = crate::s3::s3_config_parse(props.clone())?;
@@ -131,7 +131,12 @@ fn build_storage_for_scheme(
             ErrorKind::FeatureUnsupported,
             format!("Unsupported storage scheme: {unsupported}"),
         )),
-    }
+    };
+
+    storage.and_then(|storage| {
+        let settings = OpenDalStorageSettings::from_props(props)?;
+        Ok(ConfiguredOpenDalStorage::new(storage, settings))
+    })
 }
 
 /// A resolving storage factory that creates [`OpenDalResolvingStorage`] instances.
@@ -207,7 +212,7 @@ pub struct OpenDalResolvingStorage {
     props: HashMap<String, String>,
     /// Cache of canonical scheme to storage mappings.
     #[serde(skip, default)]
-    storages: RwLock<HashMap<&'static str, Arc<OpenDalStorage>>>,
+    storages: RwLock<HashMap<&'static str, Arc<ConfiguredOpenDalStorage>>>,
     /// Custom AWS credential loader for S3 storage.
     #[cfg(feature = "opendal-s3")]
     #[serde(skip)]
@@ -217,7 +222,7 @@ pub struct OpenDalResolvingStorage {
 impl OpenDalResolvingStorage {
     /// Resolve the storage for the given path by extracting the canonical scheme and
     /// returning the cached or newly-created [`OpenDalStorage`].
-    fn resolve(&self, path: &str) -> Result<Arc<OpenDalStorage>> {
+    fn resolve(&self, path: &str) -> Result<Arc<ConfiguredOpenDalStorage>> {
         let scheme = extract_scheme(path)?;
 
         // Fast path: check read lock first.
@@ -308,17 +313,11 @@ impl Storage for OpenDalResolvingStorage {
     }
 
     fn new_input(&self, path: &str) -> Result<InputFile> {
-        Ok(InputFile::new(
-            Arc::new(self.resolve(path)?.as_ref().clone()),
-            path.to_string(),
-        ))
+        Ok(InputFile::new(self.resolve(path)?, path.to_string()))
     }
 
     fn new_output(&self, path: &str) -> Result<OutputFile> {
-        Ok(OutputFile::new(
-            Arc::new(self.resolve(path)?.as_ref().clone()),
-            path.to_string(),
-        ))
+        Ok(OutputFile::new(self.resolve(path)?, path.to_string()))
     }
 }
 

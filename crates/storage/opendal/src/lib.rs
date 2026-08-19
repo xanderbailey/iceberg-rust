@@ -22,6 +22,7 @@
 //! [`StorageFactory`](StorageFactory) traits from the `iceberg` crate
 //! using [OpenDAL](https://opendal.apache.org/) as the backend.
 
+mod config;
 mod utils;
 
 use std::collections::HashMap;
@@ -31,6 +32,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use cfg_if::cfg_if;
+use config::OpenDalStorageSettings;
+pub use config::{
+    OPENDAL_IO_TIMEOUT_MS, OPENDAL_RETRY_FACTOR, OPENDAL_RETRY_JITTER, OPENDAL_RETRY_MAX_DELAY_MS,
+    OPENDAL_RETRY_MAX_TIMES, OPENDAL_RETRY_MIN_DELAY_MS, OPENDAL_TIMEOUT_MS,
+};
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use iceberg::io::{
@@ -39,7 +45,6 @@ use iceberg::io::{
 };
 use iceberg::{Error, ErrorKind, Result};
 use opendal::Operator;
-use opendal::layers::{RetryLayer, TimeoutLayer};
 use serde::{Deserialize, Serialize};
 use utils::from_opendal_error;
 
@@ -135,38 +140,36 @@ pub enum OpenDalStorageFactory {
 
 #[typetag::serde(name = "OpenDalStorageFactory")]
 impl StorageFactory for OpenDalStorageFactory {
-    #[allow(unused_variables)]
+    #[allow(unreachable_code, unused_variables)]
     fn build(&self, config: &StorageConfig) -> Result<Arc<dyn Storage>> {
-        match self {
+        let storage = match self {
             #[cfg(feature = "opendal-memory")]
-            OpenDalStorageFactory::Memory => {
-                Ok(Arc::new(OpenDalStorage::Memory(memory_config_build()?)))
-            }
+            OpenDalStorageFactory::Memory => OpenDalStorage::Memory(memory_config_build()?),
             #[cfg(feature = "opendal-fs")]
-            OpenDalStorageFactory::Fs => Ok(Arc::new(OpenDalStorage::LocalFs)),
+            OpenDalStorageFactory::Fs => OpenDalStorage::LocalFs,
             #[cfg(feature = "opendal-s3")]
             OpenDalStorageFactory::S3 {
                 customized_credential_load,
-            } => Ok(Arc::new(OpenDalStorage::S3 {
+            } => OpenDalStorage::S3 {
                 config: s3_config_parse(config.props().clone())?.into(),
                 customized_credential_load: customized_credential_load.clone(),
-            })),
+            },
             #[cfg(feature = "opendal-gcs")]
-            OpenDalStorageFactory::Gcs => Ok(Arc::new(OpenDalStorage::Gcs {
+            OpenDalStorageFactory::Gcs => OpenDalStorage::Gcs {
                 config: gcs_config_parse(config.props().clone())?.into(),
-            })),
+            },
             #[cfg(feature = "opendal-oss")]
-            OpenDalStorageFactory::Oss => Ok(Arc::new(OpenDalStorage::Oss {
+            OpenDalStorageFactory::Oss => OpenDalStorage::Oss {
                 config: oss_config_parse(config.props().clone())?.into(),
-            })),
+            },
             #[cfg(feature = "opendal-azdls")]
-            OpenDalStorageFactory::Azdls => Ok(Arc::new(OpenDalStorage::Azdls {
+            OpenDalStorageFactory::Azdls => OpenDalStorage::Azdls {
                 config: azdls_config_parse(config.props().clone())?.into(),
-            })),
+            },
             #[cfg(feature = "opendal-hf")]
-            OpenDalStorageFactory::Hf => Ok(Arc::new(OpenDalStorage::Hf {
+            OpenDalStorageFactory::Hf => OpenDalStorage::Hf {
                 config: hf_config_parse(config.props().clone())?.into(),
-            })),
+            },
             #[cfg(all(
                 not(feature = "opendal-memory"),
                 not(feature = "opendal-fs"),
@@ -176,11 +179,16 @@ impl StorageFactory for OpenDalStorageFactory {
                 not(feature = "opendal-azdls"),
                 not(feature = "opendal-hf"),
             ))]
-            _ => Err(Error::new(
-                ErrorKind::FeatureUnsupported,
-                "No storage service has been enabled",
-            )),
-        }
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::FeatureUnsupported,
+                    "No storage service has been enabled",
+                ));
+            }
+        };
+
+        let settings = OpenDalStorageSettings::from_props(config.props())?;
+        Ok(Arc::new(ConfiguredOpenDalStorage::new(storage, settings)))
     }
 }
 
@@ -188,6 +196,18 @@ impl StorageFactory for OpenDalStorageFactory {
 #[cfg(feature = "opendal-memory")]
 fn default_memory_operator() -> Operator {
     memory_config_build().expect("Failed to create default memory operator")
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ConfiguredOpenDalStorage {
+    storage: OpenDalStorage,
+    settings: OpenDalStorageSettings,
+}
+
+impl ConfiguredOpenDalStorage {
+    fn new(storage: OpenDalStorage, settings: OpenDalStorageSettings) -> Self {
+        Self { storage, settings }
+    }
 }
 
 /// OpenDAL-based storage implementation.
@@ -263,6 +283,15 @@ impl OpenDalStorage {
     pub(crate) fn create_operator<'a>(
         &self,
         path: &'a impl AsRef<str>,
+    ) -> Result<(Operator, &'a str)> {
+        self.create_operator_with_settings(path, &OpenDalStorageSettings::default())
+    }
+
+    #[allow(unreachable_code, unused_variables)]
+    fn create_operator_with_settings<'a>(
+        &self,
+        path: &'a impl AsRef<str>,
+        settings: &OpenDalStorageSettings,
     ) -> Result<(Operator, &'a str)> {
         let path = path.as_ref();
         let (operator, relative_path): (Operator, &str) = match self {
@@ -365,7 +394,9 @@ impl OpenDalStorage {
         // Transient errors are common for object stores; we retry temporary
         // failures with exponential backoff. The retry behavior also
         // benefits non-object-store backends.
-        let operator = operator.layer(TimeoutLayer::new()).layer(RetryLayer::new());
+        let operator = operator
+            .layer(settings.timeout_layer())
+            .layer(settings.retry_layer());
         Ok((operator, relative_path))
     }
 
@@ -591,6 +622,133 @@ impl Storage for OpenDalStorage {
     }
 }
 
+#[typetag::serde(name = "ConfiguredOpenDalStorage")]
+#[async_trait]
+impl Storage for ConfiguredOpenDalStorage {
+    async fn exists(&self, path: &str) -> Result<bool> {
+        let (op, relative_path) = self
+            .storage
+            .create_operator_with_settings(&path, &self.settings)?;
+        Ok(op.exists(relative_path).await.map_err(from_opendal_error)?)
+    }
+
+    async fn metadata(&self, path: &str) -> Result<FileMetadata> {
+        let (op, relative_path) = self
+            .storage
+            .create_operator_with_settings(&path, &self.settings)?;
+        let meta = op.stat(relative_path).await.map_err(from_opendal_error)?;
+        Ok(FileMetadata {
+            size: meta.content_length(),
+        })
+    }
+
+    async fn read(&self, path: &str) -> Result<Bytes> {
+        let (op, relative_path) = self
+            .storage
+            .create_operator_with_settings(&path, &self.settings)?;
+        Ok(op
+            .read(relative_path)
+            .await
+            .map_err(from_opendal_error)?
+            .to_bytes())
+    }
+
+    async fn reader(&self, path: &str) -> Result<Box<dyn FileRead>> {
+        let (op, relative_path) = self
+            .storage
+            .create_operator_with_settings(&path, &self.settings)?;
+        Ok(Box::new(OpenDalReader(
+            op.reader(relative_path).await.map_err(from_opendal_error)?,
+        )))
+    }
+
+    async fn write(&self, path: &str, bs: Bytes) -> Result<()> {
+        let (op, relative_path) = self
+            .storage
+            .create_operator_with_settings(&path, &self.settings)?;
+        op.write(relative_path, bs)
+            .await
+            .map_err(from_opendal_error)?;
+        Ok(())
+    }
+
+    async fn writer(&self, path: &str) -> Result<Box<dyn FileWrite>> {
+        let (op, relative_path) = self
+            .storage
+            .create_operator_with_settings(&path, &self.settings)?;
+        Ok(Box::new(OpenDalWriter(
+            op.writer(relative_path).await.map_err(from_opendal_error)?,
+        )))
+    }
+
+    async fn delete(&self, path: &str) -> Result<()> {
+        let (op, relative_path) = self
+            .storage
+            .create_operator_with_settings(&path, &self.settings)?;
+        Ok(op.delete(relative_path).await.map_err(from_opendal_error)?)
+    }
+
+    async fn delete_prefix(&self, path: &str) -> Result<()> {
+        let (op, relative_path) = self
+            .storage
+            .create_operator_with_settings(&path, &self.settings)?;
+        let path = if relative_path.ends_with('/') {
+            relative_path.to_string()
+        } else {
+            format!("{relative_path}/")
+        };
+        Ok(op
+            .delete_with(&path)
+            .recursive(true)
+            .await
+            .map_err(from_opendal_error)?)
+    }
+
+    async fn delete_stream(&self, mut paths: BoxStream<'static, String>) -> Result<()> {
+        let mut deleters: HashMap<String, opendal::Deleter> = HashMap::new();
+
+        while let Some(path) = paths.next().await {
+            let bucket = self.storage.batch_key_for_path(&path);
+
+            let (relative_path, deleter) = match deleters.entry(bucket) {
+                Entry::Occupied(entry) => (
+                    self.storage.relativize_path(&path)?.to_string(),
+                    entry.into_mut(),
+                ),
+                Entry::Vacant(entry) => {
+                    let (op, rel) = self
+                        .storage
+                        .create_operator_with_settings(&path, &self.settings)?;
+                    let rel = rel.to_string();
+                    let deleter = op.deleter().await.map_err(from_opendal_error)?;
+                    (rel, entry.insert(deleter))
+                }
+            };
+
+            deleter
+                .delete(relative_path)
+                .await
+                .map_err(from_opendal_error)?;
+        }
+
+        for (_, mut deleter) in deleters {
+            deleter.close().await.map_err(from_opendal_error)?;
+        }
+
+        Ok(())
+    }
+
+    #[allow(unreachable_code, unused_variables)]
+    fn new_input(&self, path: &str) -> Result<InputFile> {
+        Ok(InputFile::new(Arc::new(self.clone()), path.to_string()))
+    }
+
+    #[allow(unreachable_code, unused_variables)]
+    fn new_output(&self, path: &str) -> Result<OutputFile> {
+        Ok(OutputFile::new(Arc::new(self.clone()), path.to_string()))
+    }
+}
+
 // Newtype wrappers for opendal types to satisfy orphan rules.
 // We can't implement iceberg's FileRead/FileWrite traits directly on opendal's
 // Reader/Writer since neither trait nor type is defined in this crate.
@@ -636,6 +794,16 @@ mod tests {
     fn test_default_memory_operator() {
         let op = default_memory_operator();
         assert_eq!(op.info().scheme().to_string(), "memory");
+    }
+
+    #[cfg(feature = "opendal-memory")]
+    #[test]
+    fn test_factory_rejects_invalid_io_timeout() {
+        let config = StorageConfig::new().with_prop(OPENDAL_IO_TIMEOUT_MS, "0");
+        let error = OpenDalStorageFactory::Memory.build(&config).unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(error.message().contains(OPENDAL_IO_TIMEOUT_MS));
     }
 
     #[cfg(feature = "opendal-memory")]

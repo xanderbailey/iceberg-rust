@@ -82,3 +82,30 @@ async fn main() -> iceberg::Result<()> {
     Ok(())
 }
 ```
+
+## OpenDAL configuration
+
+OpenDAL properties are supplied through the catalog or `FileIOBuilder` storage
+configuration. They are not persisted as Iceberg table properties.
+
+The following properties configure OpenDAL's timeout and retry layers for every
+storage backend. Omitted properties retain OpenDAL's defaults.
+
+| Property | OpenDAL setting |
+| --- | --- |
+| `opendal.timeout-ms` | Control-operation timeout |
+| `opendal.io-timeout-ms` | Per-I/O timeout |
+| `opendal.retry.max-times` | Maximum retry count |
+| `opendal.retry.min-delay-ms` | Minimum retry delay |
+| `opendal.retry.max-delay-ms` | Maximum retry delay |
+| `opendal.retry.factor` | Exponential backoff factor |
+| `opendal.retry.jitter` | Whether retry jitter is enabled |
+
+```rust
+let file_io = FileIOBuilder::new(Arc::new(OpenDalStorageFactory::S3 {
+    customized_credential_load: None,
+}))
+.with_prop("opendal.io-timeout-ms", "120000")
+.with_prop("opendal.retry.max-times", "5")
+.build();
+```
