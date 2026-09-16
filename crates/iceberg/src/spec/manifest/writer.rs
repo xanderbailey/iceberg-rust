@@ -515,8 +515,7 @@ impl ManifestWriter {
             .key_metadata
             .map(|metadata| {
                 metadata
-                    .with_file_length(file_metadata.size)
-                    .encode()
+                    .encode(Some(file_metadata.size))
                     .map(|bytes| bytes.into_vec())
             })
             .transpose()?;

@@ -100,11 +100,11 @@ pub fn encode_standard_key_metadata<'py>(
     if let Some(aad_prefix) = aad_prefix {
         metadata = metadata.with_aad_prefix(aad_prefix);
     }
-    if let Some(file_length) = file_length {
-        metadata = metadata.with_file_length(file_length);
-    }
 
-    Ok(PyBytes::new(py, &metadata.encode().map_err(to_py_err)?))
+    Ok(PyBytes::new(
+        py,
+        &metadata.encode(file_length).map_err(to_py_err)?,
+    ))
 }
 
 pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {

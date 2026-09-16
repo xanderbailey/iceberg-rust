@@ -74,8 +74,12 @@ impl StandardKeyMetadata {
         self
     }
 
-    /// Sets the encrypted file length in bytes, required for AGS1 truncation protection.
-    pub fn with_file_length(mut self, length: u64) -> Self {
+    /// Sets the encrypted file length, as [`Self::decode`] would populate it.
+    ///
+    /// Test-only: on the write path the length is supplied to [`Self::encode`], so production
+    /// code cannot construct metadata carrying a length it did not read off the wire.
+    #[cfg(test)]
+    pub(crate) fn with_file_length(mut self, length: u64) -> Self {
         self.file_length = Some(length);
         self
     }
@@ -90,14 +94,22 @@ impl StandardKeyMetadata {
         self.aad_prefix.as_deref()
     }
 
-    /// Returns the encrypted file length in bytes, required for AGS1 files.
+    /// Returns the encrypted file length in bytes, as read off the wire by [`Self::decode`].
+    ///
+    /// `None` for metadata written without one, which AGS1 reads reject.
     pub fn file_length(&self) -> Option<u64> {
         self.file_length
     }
 
     /// Encodes to Java-compatible format: `[0x01] [Avro binary datum]`
-    pub fn encode(&self) -> Result<Box<[u8]>> {
-        _serde::StandardKeyMetadataV1::from(self).encode()
+    ///
+    /// `file_length` is the size of the file this metadata describes, as reported by
+    /// [`FileWrite::close`](crate::io::FileWrite::close) — the ciphertext size for AGS1
+    /// streams, which reads require to detect truncation. It is an argument rather than a
+    /// property so that omitting it has to be deliberate; pass `None` only for files whose
+    /// format carries its own length, such as Parquet.
+    pub fn encode(&self, file_length: Option<u64>) -> Result<Box<[u8]>> {
+        _serde::StandardKeyMetadataV1::new(self, file_length).encode()
     }
 
     /// Decodes from Java-compatible format.
@@ -225,15 +237,17 @@ mod _serde {
         }
     }
 
-    impl From<&StandardKeyMetadata> for StandardKeyMetadataV1 {
-        fn from(metadata: &StandardKeyMetadata) -> Self {
+    impl StandardKeyMetadataV1 {
+        /// Takes the length from the caller rather than `metadata.file_length`, so a length
+        /// only reaches the wire when the writer supplied one.
+        pub(super) fn new(metadata: &StandardKeyMetadata, file_length: Option<u64>) -> Self {
             Self {
                 encryption_key: serde_bytes::ByteBuf::from(metadata.encryption_key.as_bytes()),
                 aad_prefix: metadata
                     .aad_prefix
                     .as_ref()
                     .map(|b| serde_bytes::ByteBuf::from(b.as_ref())),
-                file_length: metadata.file_length,
+                file_length,
             }
         }
     }
@@ -267,33 +281,46 @@ mod tests {
         let key = b"0123456789012345";
         let aad = b"1234567890123456";
 
-        let metadata = StandardKeyMetadata::try_new(key)
-            .unwrap()
-            .with_aad_prefix(aad);
-        let serialized = metadata.encode().unwrap();
-        let parsed = StandardKeyMetadata::decode(&serialized).unwrap();
-
-        assert_eq!(parsed.encryption_key().as_bytes(), key);
-        assert_eq!(parsed.aad_prefix(), Some(aad.as_slice()));
-        assert_eq!(parsed.file_length(), None);
-    }
-
-    #[test]
-    fn test_roundtrip_with_length() {
-        let key = b"0123456789012345";
-        let aad = b"1234567890123456";
-
         let file_length = 100_000;
         let metadata = StandardKeyMetadata::try_new(key)
             .unwrap()
-            .with_aad_prefix(aad)
-            .with_file_length(file_length);
-        let serialized = metadata.encode().unwrap();
+            .with_aad_prefix(aad);
+        let serialized = metadata.encode(Some(file_length)).unwrap();
         let parsed = StandardKeyMetadata::decode(&serialized).unwrap();
 
         assert_eq!(parsed.encryption_key().as_bytes(), key);
         assert_eq!(parsed.aad_prefix(), Some(aad.as_slice()));
         assert_eq!(parsed.file_length(), Some(file_length));
+    }
+
+    #[test]
+    fn test_encode_ignores_any_decoded_length() {
+        // The length on the wire is the argument, never a value carried on the struct.
+        let metadata = StandardKeyMetadata::try_new(b"0123456789012345")
+            .unwrap()
+            .with_file_length(1);
+
+        assert_eq!(
+            StandardKeyMetadata::decode(&metadata.encode(Some(2)).unwrap())
+                .unwrap()
+                .file_length(),
+            Some(2)
+        );
+        assert_eq!(
+            StandardKeyMetadata::decode(&metadata.encode(None).unwrap())
+                .unwrap()
+                .file_length(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_roundtrip_without_file_length() {
+        // Parquet and other self-describing formats omit it; AGS1 reads reject the result.
+        let metadata = StandardKeyMetadata::try_new(b"0123456789012345").unwrap();
+        let parsed = StandardKeyMetadata::decode(&metadata.encode(None).unwrap()).unwrap();
+
+        assert_eq!(parsed.file_length(), None);
     }
 
     #[test]
@@ -319,7 +346,7 @@ mod tests {
     fn test_roundtrip_without_aad() {
         let key = b"0123456789012345";
         let metadata = StandardKeyMetadata::try_new(key).unwrap();
-        let serialized = metadata.encode().unwrap();
+        let serialized = metadata.encode(Some(4096)).unwrap();
         let parsed = StandardKeyMetadata::decode(&serialized).unwrap();
 
         assert_eq!(parsed.encryption_key().as_bytes(), key);
@@ -376,8 +403,7 @@ mod tests {
         let serialized = StandardKeyMetadata::try_new(key)
             .unwrap()
             .with_aad_prefix(aad)
-            .with_file_length(file_length)
-            .encode()
+            .encode(Some(file_length))
             .unwrap();
 
         // Arbitrary junk, then bytes shaped like a further optional field appended by a
