@@ -1113,7 +1113,7 @@ mod tests {
         let key_metadata = crate::encryption::StandardKeyMetadata::try_new(encryption_key)
             .unwrap()
             .with_aad_prefix(aad_prefix)
-            .encode()
+            .encode(Some(std::fs::metadata(&file_path).unwrap().len()))
             .unwrap();
 
         let reader = ArrowReaderBuilder::new(file_io, Runtime::current()).build();
@@ -2611,7 +2611,7 @@ mod tests {
 
         let wrong_key_metadata = crate::encryption::StandardKeyMetadata::try_new(wrong_key)
             .unwrap()
-            .encode()
+            .encode(Some(std::fs::metadata(&file_path).unwrap().len()))
             .unwrap();
 
         let reader = ArrowReaderBuilder::new(file_io, Runtime::current()).build();

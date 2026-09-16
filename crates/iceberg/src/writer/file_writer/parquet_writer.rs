@@ -500,8 +500,10 @@ impl ParquetWriter {
             )
         };
 
+        // Parquet-native encryption doesn't consume the length on read, but Java records it
+        // for data files too, so keep the metadata identical across clients.
         let key_metadata = match key_metadata {
-            Some(m) => Some(m.encode()?.into_vec()),
+            Some(m) => Some(m.encode(Some(written_size as u64))?.into_vec()),
             None => None,
         };
 

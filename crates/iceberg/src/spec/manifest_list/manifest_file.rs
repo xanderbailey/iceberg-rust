@@ -325,9 +325,13 @@ mod test {
         // returning garbage.
         let wrong_key_metadata = StandardKeyMetadata::try_new(b"fedcba9876543210")
             .unwrap()
-            .with_aad_prefix(b"test-aad-prefix!")
-            .with_file_length(manifest_file.manifest_length as u64);
-        manifest_file.key_metadata = Some(wrong_key_metadata.encode().unwrap().to_vec());
+            .with_aad_prefix(b"test-aad-prefix!");
+        manifest_file.key_metadata = Some(
+            wrong_key_metadata
+                .encode(Some(manifest_file.manifest_length as u64))
+                .unwrap()
+                .to_vec(),
+        );
 
         let err = ManifestReader::new(io)
             .read(&manifest_file)
@@ -351,9 +355,13 @@ mod test {
         // so GCM authentication must fail even though the key is right.
         let wrong_aad_metadata = StandardKeyMetadata::try_new(b"0123456789abcdef")
             .unwrap()
-            .with_aad_prefix(b"wrong-aad-prefix")
-            .with_file_length(manifest_file.manifest_length as u64);
-        manifest_file.key_metadata = Some(wrong_aad_metadata.encode().unwrap().to_vec());
+            .with_aad_prefix(b"wrong-aad-prefix");
+        manifest_file.key_metadata = Some(
+            wrong_aad_metadata
+                .encode(Some(manifest_file.manifest_length as u64))
+                .unwrap()
+                .to_vec(),
+        );
 
         let err = ManifestReader::new(io)
             .read(&manifest_file)

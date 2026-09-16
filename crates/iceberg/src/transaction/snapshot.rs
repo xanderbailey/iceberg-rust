@@ -498,9 +498,7 @@ impl<'a> SnapshotProducer<'a> {
                 self.table
                     .encryption_manager()
                     .expect("Encryption manager must be present when key metadata exists")
-                    .encrypt_manifest_list_key_metadata(
-                        &key_metadata.with_file_length(file_metadata.size),
-                    )
+                    .encrypt_manifest_list_key_metadata(&key_metadata, file_metadata.size)
                     .await?,
             )
         } else {

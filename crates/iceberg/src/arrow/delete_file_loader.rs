@@ -206,7 +206,7 @@ mod tests {
         let key_metadata = StandardKeyMetadata::try_new(encryption_key)
             .unwrap()
             .with_aad_prefix(aad_prefix)
-            .encode()
+            .encode(Some(std::fs::metadata(&del_path).unwrap().len()))
             .unwrap();
 
         let schema = Arc::new(
@@ -291,7 +291,7 @@ mod tests {
         let key_metadata = StandardKeyMetadata::try_new(encryption_key)
             .unwrap()
             .with_aad_prefix(aad_prefix)
-            .encode()
+            .encode(Some(std::fs::metadata(&del_path).unwrap().len()))
             .unwrap();
 
         let schema = Arc::new(

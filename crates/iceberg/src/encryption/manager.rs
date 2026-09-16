@@ -162,9 +162,13 @@ impl EncryptionManager {
     ///
     /// Returns the `key_id` of the wrapped entry, which should be recorded on
     /// the snapshot as `encryption_key_id` so readers can locate it later.
+    ///
+    /// `file_length` is the written size of the manifest list, needed for AGS1 truncation
+    /// protection.
     pub async fn encrypt_manifest_list_key_metadata(
         &self,
         key_metadata: &StandardKeyMetadata,
+        file_length: u64,
     ) -> Result<String> {
         let kek = match self.find_active_kek()? {
             Some(existing) => existing,
@@ -175,7 +179,7 @@ impl EncryptionManager {
 
         // Use the KEK timestamp as AAD to prevent timestamp tampering attacks.
         let aad = Self::kek_timestamp_aad(&kek)?;
-        let serialized = key_metadata.encode()?;
+        let serialized = key_metadata.encode(Some(file_length))?;
         let wrapped_metadata = self.wrap_dek_with_kek(&serialized, &kek_bytes, Some(aad))?;
 
         let wrapped_key = EncryptedKey::builder()
@@ -449,6 +453,8 @@ mod tests {
         assert!(kek.properties().contains_key(KEK_CREATED_AT_PROPERTY));
     }
 
+    const SAMPLE_FILE_LENGTH: u64 = 4096;
+
     fn sample_key_metadata() -> StandardKeyMetadata {
         StandardKeyMetadata::try_new(b"0123456789abcdef")
             .unwrap()
@@ -461,7 +467,7 @@ mod tests {
         let plaintext = sample_key_metadata();
 
         let key_id = mgr
-            .encrypt_manifest_list_key_metadata(&plaintext)
+            .encrypt_manifest_list_key_metadata(&plaintext, SAMPLE_FILE_LENGTH)
             .await
             .unwrap();
 
@@ -472,7 +478,7 @@ mod tests {
             .decrypt_manifest_list_key_metadata(&key_id)
             .await
             .unwrap();
-        assert_eq!(decrypted, plaintext);
+        assert_eq!(decrypted, plaintext.with_file_length(SAMPLE_FILE_LENGTH));
     }
 
     #[tokio::test]
@@ -481,7 +487,7 @@ mod tests {
 
         // First wrap creates a new KEK + wrapped entry (2 keys)
         let _id1 = mgr
-            .encrypt_manifest_list_key_metadata(&sample_key_metadata())
+            .encrypt_manifest_list_key_metadata(&sample_key_metadata(), SAMPLE_FILE_LENGTH)
             .await
             .unwrap();
         let kek_id = mgr.with_encryption_keys(|keys| {
@@ -495,7 +501,7 @@ mod tests {
 
         // Second wrap should reuse the existing KEK (only adds 1 new wrapped entry)
         let id2 = mgr
-            .encrypt_manifest_list_key_metadata(&sample_key_metadata())
+            .encrypt_manifest_list_key_metadata(&sample_key_metadata(), SAMPLE_FILE_LENGTH)
             .await
             .unwrap();
         let entry2 = mgr.with_encryption_keys(|keys| {
@@ -537,7 +543,7 @@ mod tests {
 
         // Wrap should rotate to a new KEK since the existing one is expired
         let new_entry_id = mgr
-            .encrypt_manifest_list_key_metadata(&sample_key_metadata())
+            .encrypt_manifest_list_key_metadata(&sample_key_metadata(), SAMPLE_FILE_LENGTH)
             .await
             .unwrap();
         let entry = mgr
@@ -573,7 +579,7 @@ mod tests {
 
         // First wrap caches the plaintext KEK during create_kek().
         let key_id = mgr
-            .encrypt_manifest_list_key_metadata(&sample_key_metadata())
+            .encrypt_manifest_list_key_metadata(&sample_key_metadata(), SAMPLE_FILE_LENGTH)
             .await
             .unwrap();
 
@@ -590,7 +596,7 @@ mod tests {
 
         // Wrap some metadata to get a valid encrypted entry stored on the manager
         let entry_id = mgr
-            .encrypt_manifest_list_key_metadata(&sample_key_metadata())
+            .encrypt_manifest_list_key_metadata(&sample_key_metadata(), SAMPLE_FILE_LENGTH)
             .await
             .unwrap();
 
@@ -633,7 +639,7 @@ mod tests {
 
         // Wrap metadata normally
         let entry_id = mgr
-            .encrypt_manifest_list_key_metadata(&sample_key_metadata())
+            .encrypt_manifest_list_key_metadata(&sample_key_metadata(), SAMPLE_FILE_LENGTH)
             .await
             .unwrap();
 
@@ -695,9 +701,7 @@ mod tests {
 
         let serialized_metadata = encrypted_output
             .key_metadata()
-            .clone()
-            .with_file_length(file_metadata.size)
-            .encode()
+            .encode(Some(file_metadata.size))
             .unwrap();
 
         let input = io.new_input(path).unwrap();

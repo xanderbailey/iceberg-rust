@@ -302,7 +302,7 @@ pub struct iceberg::encryption::EncryptionManager
 impl iceberg::encryption::EncryptionManager
 pub async fn iceberg::encryption::EncryptionManager::decrypt_manifest_list_key_metadata(&self, encryption_key_id: &str) -> iceberg::Result<iceberg::encryption::StandardKeyMetadata>
 pub fn iceberg::encryption::EncryptionManager::encrypt(&self, raw_output: iceberg::io::OutputFile) -> iceberg::encryption::EncryptedOutputFile
-pub async fn iceberg::encryption::EncryptionManager::encrypt_manifest_list_key_metadata(&self, key_metadata: &iceberg::encryption::StandardKeyMetadata) -> iceberg::Result<alloc::string::String>
+pub async fn iceberg::encryption::EncryptionManager::encrypt_manifest_list_key_metadata(&self, key_metadata: &iceberg::encryption::StandardKeyMetadata, file_length: u64) -> iceberg::Result<alloc::string::String>
 pub fn iceberg::encryption::EncryptionManager::generate_key_metadata(&self) -> iceberg::encryption::StandardKeyMetadata
 pub fn iceberg::encryption::EncryptionManager::with_encryption_keys<F, R>(&self, f: F) -> R where F: core::ops::function::FnOnce(&std::collections::hash::map::HashMap<alloc::string::String, iceberg::spec::EncryptedKey>) -> R
 impl core::fmt::Debug for iceberg::encryption::EncryptionManager
@@ -356,12 +356,11 @@ pub struct iceberg::encryption::StandardKeyMetadata
 impl iceberg::encryption::StandardKeyMetadata
 pub fn iceberg::encryption::StandardKeyMetadata::aad_prefix(&self) -> core::option::Option<&[u8]>
 pub fn iceberg::encryption::StandardKeyMetadata::decode(bytes: &[u8]) -> iceberg::Result<Self>
-pub fn iceberg::encryption::StandardKeyMetadata::encode(&self) -> iceberg::Result<alloc::boxed::Box<[u8]>>
+pub fn iceberg::encryption::StandardKeyMetadata::encode(&self, file_length: core::option::Option<u64>) -> iceberg::Result<alloc::boxed::Box<[u8]>>
 pub fn iceberg::encryption::StandardKeyMetadata::encryption_key(&self) -> &iceberg::encryption::SecureKey
 pub fn iceberg::encryption::StandardKeyMetadata::file_length(&self) -> core::option::Option<u64>
 pub fn iceberg::encryption::StandardKeyMetadata::try_new(encryption_key: &[u8]) -> iceberg::Result<Self>
 pub fn iceberg::encryption::StandardKeyMetadata::with_aad_prefix(self, aad_prefix: &[u8]) -> Self
-pub fn iceberg::encryption::StandardKeyMetadata::with_file_length(self, length: u64) -> Self
 impl core::clone::Clone for iceberg::encryption::StandardKeyMetadata
 pub fn iceberg::encryption::StandardKeyMetadata::clone(&self) -> iceberg::encryption::StandardKeyMetadata
 impl core::cmp::Eq for iceberg::encryption::StandardKeyMetadata

@@ -1655,9 +1655,7 @@ mod tests {
         let file_metadata = output.write(Bytes::from(blob)).await.unwrap();
         let encoded_key_metadata = output
             .key_metadata()
-            .clone()
-            .with_file_length(file_metadata.size)
-            .encode()
+            .encode(Some(file_metadata.size))
             .unwrap();
 
         // content_offset / content_size_in_bytes are in the plaintext coordinate space, distinct
