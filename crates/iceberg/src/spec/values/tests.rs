@@ -231,6 +231,87 @@ fn json_timestamptz() {
     );
 }
 
+/// Iceberg's `date` is an `i32` day count and its `timestamp` an `i64` microsecond count, both
+/// of which reach years chrono cannot represent. Java writes years outside 0000-9999 with a
+/// sign prefix; these vectors were generated with `DateTimeFormatter.ISO_LOCAL_DATE`.
+#[test]
+fn json_date_outside_chrono_year_range() {
+    for (record, days) in [
+        (r#""+5881580-07-11""#, i32::MAX),
+        (r#""-5877641-06-23""#, i32::MIN),
+        (r#""+280000-02-29""#, 101_548_431),
+        (r#""-280000-02-29""#, -102_987_369),
+        (r#""+280400-02-29""#, 101_694_528),
+        (r#""+10000-01-01""#, 2_932_897),
+        (r#""-0001-03-01""#, -719_834),
+        (r#""0000-02-29""#, -719_469),
+        (r#""1900-03-01""#, -25_508),
+    ] {
+        check_json_serde(
+            record,
+            Literal::Primitive(PrimitiveLiteral::Int(days)),
+            &Primitive(PrimitiveType::Date),
+        );
+    }
+}
+
+#[test]
+fn json_timestamp_outside_chrono_year_range() {
+    for (record, micros) in [
+        (r#""+294247-01-10T04:00:54.775807""#, i64::MAX),
+        (r#""-290308-12-21T19:59:05.224192""#, i64::MIN),
+        (r#""+10000-01-01T00:00:00""#, 253_402_300_800_000_000),
+        (r#""-0001-03-01T12:00:00""#, -62_193_614_400_000_000),
+    ] {
+        check_json_serde(
+            record,
+            Literal::Primitive(PrimitiveLiteral::Long(micros)),
+            &Primitive(PrimitiveType::Timestamp),
+        );
+    }
+}
+
+#[test]
+fn json_temporal_values_beyond_the_iceberg_range_are_rejected() {
+    for (record, ty) in [
+        (r#""+5881580-07-12""#, PrimitiveType::Date),
+        (r#""-5877641-06-22""#, PrimitiveType::Date),
+        (r#""+99999999999999999999-01-01""#, PrimitiveType::Date),
+        (
+            r#""+294247-01-10T04:00:54.775808""#,
+            PrimitiveType::Timestamp,
+        ),
+        (
+            r#""-290308-12-21T19:59:05.224191""#,
+            PrimitiveType::Timestamp,
+        ),
+        (
+            r#""+294247-01-10T04:00:54.775808+00:00""#,
+            PrimitiveType::Timestamptz,
+        ),
+    ] {
+        let value = serde_json::from_str::<JsonValue>(record).unwrap();
+        assert!(
+            Literal::try_from_json(value, &Primitive(ty)).is_err(),
+            "{record}"
+        );
+    }
+}
+
+#[test]
+fn json_timestamptz_outside_chrono_year_range() {
+    for (record, micros) in [
+        (r#""+294247-01-10T04:00:54.775807+00:00""#, i64::MAX),
+        (r#""-290308-12-21T19:59:05.224192+00:00""#, i64::MIN),
+    ] {
+        check_json_serde(
+            record,
+            Literal::Primitive(PrimitiveLiteral::Long(micros)),
+            &Primitive(PrimitiveType::Timestamptz),
+        );
+    }
+}
+
 #[test]
 fn json_timestamp_ns() {
     let record = r#""2017-11-16T22:31:08.123456789""#;
