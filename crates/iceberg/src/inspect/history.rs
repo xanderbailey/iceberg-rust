@@ -78,14 +78,16 @@ impl<'a> HistoryTable<'a> {
     /// Scans the history table.
     pub async fn scan(&self) -> Result<ArrowRecordBatchStream> {
         let schema = schema_to_arrow_schema(&self.schema())?;
-        let metadata = self.table.metadata();
+        // The ancestry walk below needs every snapshot, not just the referenced ones.
+        let table = self.table.ensure_all_snapshots().await?;
+        let metadata = table.metadata();
 
         // Walk the current snapshot's parent chain once: membership in this set
         // is what tells the live lineage apart from rolled-back history entries.
         let ancestors: HashSet<i64> = metadata
             .current_snapshot_id()
             .map(|id| {
-                ancestors_of(&self.table.metadata_ref(), id)
+                ancestors_of(&table.metadata_ref(), id)
                     .map(|snapshot| snapshot.snapshot_id())
                     .collect()
             })

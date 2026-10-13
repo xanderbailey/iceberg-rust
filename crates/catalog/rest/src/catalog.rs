@@ -26,7 +26,9 @@ use std::sync::{Arc, OnceLock};
 use async_trait::async_trait;
 use iceberg::encryption::kms::{KeyManagementClient, KmsClientFactory};
 use iceberg::io::{FileIO, FileIOBuilder, StorageFactory};
-use iceberg::table::Table;
+use iceberg::spec::SnapshotRef;
+pub use iceberg::table::SnapshotLoadingMode;
+use iceberg::table::{SnapshotLoader, Table};
 use iceberg::{
     Catalog, CatalogBuilder, Error, ErrorKind, Namespace, NamespaceIdent, Result, Runtime,
     SessionCatalog, SessionContext, TableCommit, TableCreation, TableIdent,
@@ -66,54 +68,10 @@ pub const REST_CATALOG_PROP_DISABLE_HEADER_REDACTION: &str = "disable-header-red
 /// otherwise.
 pub const REST_CATALOG_PROP_AUTH_TYPE: &str = "rest.auth.type";
 /// Snapshots to request when loading a table: `all` or `refs`, see
-/// [`SnapshotLoadingMode`]. When unset, the `snapshots` query parameter is
-/// omitted and the server applies its default (`all`).
+/// [`SnapshotLoadingMode`]. Sent as the `snapshots` query parameter of
+/// `GET /v1/{prefix}/namespaces/{namespace}/tables/{table}`. When unset, the
+/// parameter is omitted and the server applies its default (`all`).
 pub const REST_CATALOG_PROP_SNAPSHOT_LOADING_MODE: &str = "snapshot-loading-mode";
-
-/// The `snapshots` query parameter of `GET /v1/{prefix}/namespaces/{namespace}/tables/{table}`,
-/// configured with [`REST_CATALOG_PROP_SNAPSHOT_LOADING_MODE`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SnapshotLoadingMode {
-    /// Request every snapshot. This is what a server returns when the
-    /// parameter is omitted.
-    All,
-    /// Request only the snapshots referenced by a branch or tag, so servers
-    /// can skip the rest of the snapshot history.
-    ///
-    /// The loaded metadata then has no snapshots other than those, and this
-    /// catalog does not transparently re-load the full history: operations
-    /// that need an unreferenced snapshot (time travel to one, or reading the
-    /// full `history`/`snapshots` metadata tables) will not find it.
-    Refs,
-}
-
-impl SnapshotLoadingMode {
-    /// The value to send as the `snapshots` query parameter.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            SnapshotLoadingMode::All => "all",
-            SnapshotLoadingMode::Refs => "refs",
-        }
-    }
-}
-
-impl FromStr for SnapshotLoadingMode {
-    type Err = Error;
-
-    fn from_str(mode: &str) -> Result<Self> {
-        match mode.to_ascii_lowercase().as_str() {
-            "all" => Ok(SnapshotLoadingMode::All),
-            "refs" => Ok(SnapshotLoadingMode::Refs),
-            other => Err(Error::new(
-                ErrorKind::DataInvalid,
-                format!(
-                    "unknown '{REST_CATALOG_PROP_SNAPSHOT_LOADING_MODE}': {other}; \
-                     expected `all` or `refs`"
-                ),
-            )),
-        }
-    }
-}
 
 const ICEBERG_REST_SPEC_VERSION: &str = "0.14.1";
 const CARGO_PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -477,6 +435,53 @@ pub(crate) fn oauth_params_from_props(props: &HashMap<String, String>) -> HashMa
     params
 }
 
+/// Re-reads a table with `snapshots=all` so a refs-loaded [`Table`] can recover the
+/// snapshots the first request skipped.
+#[derive(Debug)]
+struct RestSnapshotLoader {
+    client: RestCatalogClient,
+    context: SessionContext,
+    table_ident: TableIdent,
+}
+
+#[async_trait]
+impl SnapshotLoader for RestSnapshotLoader {
+    async fn load_all_snapshots(&self) -> Result<Vec<SnapshotRef>> {
+        let request = HttpRequest::build(
+            self.client
+                .http_client
+                .request(
+                    Method::GET,
+                    self.client.config.table_endpoint(&self.table_ident),
+                )
+                .query(&[("snapshots", SnapshotLoadingMode::All.as_str())]),
+        )?;
+
+        let http_response = self.client.query_catalog(&self.context, request).await?;
+
+        let response = match http_response.status() {
+            StatusCode::OK | StatusCode::NOT_MODIFIED => {
+                deserialize_catalog_response::<LoadTableResult>(http_response)?
+            }
+            StatusCode::NOT_FOUND => {
+                return Err(Error::new(
+                    ErrorKind::TableNotFound,
+                    "Tried to reload snapshots for a table that does not exist",
+                ));
+            }
+            _ => {
+                return Err(deserialize_unexpected_catalog_error(
+                    http_response,
+                    self.client.http_client.disable_header_redaction(),
+                ));
+            }
+        };
+
+        Ok(response.metadata.snapshots().cloned().collect())
+    }
+}
+
+#[derive(Clone)]
 struct RestCatalogClient {
     /// The manager that created `catalog_session`; retained so each request can
     /// derive authentication for its [`SessionContext`].
@@ -1309,12 +1314,13 @@ impl SessionCatalog for RestSessionCatalog {
         table_ident: &TableIdent,
     ) -> Result<Table> {
         let client = self.client().await?;
+        let configured_mode = client.config.snapshot_loading_mode()?;
 
         let mut request_builder = client
             .http_client
             .request(Method::GET, client.config.table_endpoint(table_ident));
 
-        if let Some(mode) = client.config.snapshot_loading_mode()? {
+        if let Some(mode) = configured_mode {
             request_builder = request_builder.query(&[("snapshots", mode.as_str())]);
         }
 
@@ -1354,9 +1360,20 @@ impl SessionCatalog for RestSessionCatalog {
             .identifier(table_ident.clone())
             .file_io(file_io)
             .metadata(response.metadata)
+            // Unset means the server applies its default, which is `all`.
+            .snapshot_loading_mode(configured_mode.unwrap_or_default())
             .runtime(self.runtime.clone());
         if let Some(kms_client) = self.kms_client.clone() {
             table_builder = table_builder.kms_client(kms_client);
+        }
+
+        // Only refs-loaded metadata is incomplete, so only it needs a way back to full history.
+        if configured_mode == Some(SnapshotLoadingMode::Refs) {
+            table_builder = table_builder.snapshot_loader(Arc::new(RestSnapshotLoader {
+                client: client.clone(),
+                context: context.clone(),
+                table_ident: table_ident.clone(),
+            }));
         }
 
         if let Some(metadata_location) = response.metadata_location {
@@ -4090,6 +4107,14 @@ mod tests {
     }
 
     async fn load_table_mock(server: &mut ServerGuard, query: mockito::Matcher) -> Mock {
+        load_table_mock_from(server, query, "load_table_response.json").await
+    }
+
+    async fn load_table_mock_from(
+        server: &mut ServerGuard,
+        query: mockito::Matcher,
+        body_file: &str,
+    ) -> Mock {
         server
             .mock("GET", "/v1/namespaces/ns1/tables/test1")
             .match_query(query)
@@ -4097,10 +4122,105 @@ mod tests {
             .with_body_from_file(format!(
                 "{}/testdata/{}",
                 env!("CARGO_MANIFEST_DIR"),
-                "load_table_response.json"
+                body_file
             ))
             .create_async()
             .await
+    }
+
+    fn snapshots_query(value: &str) -> mockito::Matcher {
+        mockito::Matcher::UrlEncoded("snapshots".to_string(), value.to_string())
+    }
+
+    fn refs_mode_catalog(server: &ServerGuard) -> RestSessionCatalog {
+        session_catalog(
+            RestCatalogConfig::builder()
+                .uri(server.url())
+                .props(HashMap::from([(
+                    REST_CATALOG_PROP_SNAPSHOT_LOADING_MODE.to_string(),
+                    "refs".to_string(),
+                )]))
+                .build(),
+        )
+    }
+
+    /// End-to-end: a refs load omits the parent snapshot, and `ensure_all_snapshots` recovers it
+    /// with a second `snapshots=all` request.
+    #[tokio::test]
+    async fn test_ensure_all_snapshots_reloads_over_http() {
+        let mut server = Server::new_async().await;
+        let config_mock = create_config_mock(&mut server).await;
+        let refs_mock = load_table_mock_from(
+            &mut server,
+            snapshots_query("refs"),
+            "load_table_refs_response.json",
+        )
+        .await;
+        let all_mock = load_table_mock_from(
+            &mut server,
+            snapshots_query("all"),
+            "load_table_all_response.json",
+        )
+        .await;
+
+        let catalog = refs_mode_catalog(&server);
+        let table = catalog
+            .load_table(
+                &SessionContext::empty(),
+                &TableIdent::from_strs(["ns1", "test1"]).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // The refs response carries only `main`'s head, whose parent pointer dangles.
+        assert_eq!(table.metadata().snapshots().count(), 1);
+        let current = table.metadata().current_snapshot().unwrap();
+        let parent_id = current.parent_snapshot_id().unwrap();
+        assert!(table.metadata().snapshot_by_id(parent_id).is_none());
+
+        let full = table.ensure_all_snapshots().await.unwrap();
+
+        assert_eq!(full.snapshot_loading_mode(), SnapshotLoadingMode::All);
+        assert_eq!(full.metadata().snapshots().count(), 2);
+        assert!(full.metadata().snapshot_by_id(parent_id).is_some());
+        // Reloading only grafts snapshots on; the rest of the metadata stays pinned.
+        assert_eq!(
+            full.metadata().current_snapshot_id(),
+            table.metadata().current_snapshot_id()
+        );
+
+        config_mock.assert_async().await;
+        refs_mock.assert_async().await;
+        all_mock.assert_async().await;
+    }
+
+    /// Metadata that already holds every snapshot must not trigger a second request. There is no
+    /// `snapshots=all` mock here, so a reload would fail the call.
+    #[tokio::test]
+    async fn test_ensure_all_snapshots_is_a_noop_for_all_mode() {
+        let mut server = Server::new_async().await;
+        let config_mock = create_config_mock(&mut server).await;
+        let table_mock = load_table_mock(&mut server, mockito::Matcher::Missing).await;
+
+        let catalog = session_catalog(RestCatalogConfig::builder().uri(server.url()).build());
+        let table = catalog
+            .load_table(
+                &SessionContext::empty(),
+                &TableIdent::from_strs(["ns1", "test1"]).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let full = table.ensure_all_snapshots().await.unwrap();
+
+        assert_eq!(full.snapshot_loading_mode(), SnapshotLoadingMode::All);
+        assert_eq!(
+            full.metadata().snapshots().count(),
+            table.metadata().snapshots().count()
+        );
+
+        config_mock.assert_async().await;
+        table_mock.assert_async().await;
     }
 
     #[tokio::test]
@@ -4110,7 +4230,7 @@ mod tests {
         let table_mock = load_table_mock(&mut server, mockito::Matcher::Missing).await;
 
         let catalog = session_catalog(RestCatalogConfig::builder().uri(server.url()).build());
-        catalog
+        let table = catalog
             .load_table(
                 &SessionContext::empty(),
                 &TableIdent::from_strs(["ns1", "test1"]).unwrap(),
@@ -4118,13 +4238,17 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(table.snapshot_loading_mode(), SnapshotLoadingMode::All);
         config_mock.assert_async().await;
         table_mock.assert_async().await;
     }
 
     #[tokio::test]
     async fn test_load_table_sends_snapshot_loading_mode() {
-        for (prop, expected) in [("refs", "refs"), ("ALL", "all")] {
+        for (prop, expected, mode) in [
+            ("refs", "refs", SnapshotLoadingMode::Refs),
+            ("ALL", "all", SnapshotLoadingMode::All),
+        ] {
             let mut server = Server::new_async().await;
             let config_mock = create_config_mock(&mut server).await;
             let table_mock = load_table_mock(
@@ -4142,7 +4266,7 @@ mod tests {
                     )]))
                     .build(),
             );
-            catalog
+            let table = catalog
                 .load_table(
                     &SessionContext::empty(),
                     &TableIdent::from_strs(["ns1", "test1"]).unwrap(),
@@ -4150,6 +4274,7 @@ mod tests {
                 .await
                 .unwrap();
 
+            assert_eq!(table.snapshot_loading_mode(), mode);
             config_mock.assert_async().await;
             table_mock.assert_async().await;
         }

@@ -3244,6 +3244,25 @@ pub type iceberg::spec::ViewMetadataRef = alloc::sync::Arc<iceberg::spec::ViewMe
 pub type iceberg::spec::ViewVersionId = i32
 pub type iceberg::spec::ViewVersionRef = alloc::sync::Arc<iceberg::spec::ViewVersion>
 pub mod iceberg::table
+pub enum iceberg::table::SnapshotLoadingMode
+pub iceberg::table::SnapshotLoadingMode::All
+pub iceberg::table::SnapshotLoadingMode::Refs
+impl iceberg::table::SnapshotLoadingMode
+pub fn iceberg::table::SnapshotLoadingMode::as_str(&self) -> &'static str
+impl core::clone::Clone for iceberg::table::SnapshotLoadingMode
+pub fn iceberg::table::SnapshotLoadingMode::clone(&self) -> iceberg::table::SnapshotLoadingMode
+impl core::cmp::Eq for iceberg::table::SnapshotLoadingMode
+impl core::cmp::PartialEq for iceberg::table::SnapshotLoadingMode
+pub fn iceberg::table::SnapshotLoadingMode::eq(&self, other: &iceberg::table::SnapshotLoadingMode) -> bool
+impl core::default::Default for iceberg::table::SnapshotLoadingMode
+pub fn iceberg::table::SnapshotLoadingMode::default() -> iceberg::table::SnapshotLoadingMode
+impl core::fmt::Debug for iceberg::table::SnapshotLoadingMode
+pub fn iceberg::table::SnapshotLoadingMode::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for iceberg::table::SnapshotLoadingMode
+impl core::marker::StructuralPartialEq for iceberg::table::SnapshotLoadingMode
+impl core::str::traits::FromStr for iceberg::table::SnapshotLoadingMode
+pub type iceberg::table::SnapshotLoadingMode::Err = iceberg::Error
+pub fn iceberg::table::SnapshotLoadingMode::from_str(mode: &str) -> iceberg::Result<Self>
 pub struct iceberg::table::StaticTable(_)
 impl iceberg::table::StaticTable
 pub async fn iceberg::table::StaticTable::from_metadata(metadata: iceberg::spec::TableMetadata, table_ident: iceberg::TableIdent, file_io: iceberg::io::FileIO) -> iceberg::Result<Self>
@@ -3261,6 +3280,7 @@ impl iceberg::table::Table
 pub fn iceberg::table::Table::builder() -> iceberg::table::TableBuilder
 pub fn iceberg::table::Table::current_schema_ref(&self) -> iceberg::spec::SchemaRef
 pub fn iceberg::table::Table::encryption_manager(&self) -> core::option::Option<&alloc::sync::Arc<iceberg::encryption::EncryptionManager>>
+pub async fn iceberg::table::Table::ensure_all_snapshots(&self) -> iceberg::Result<iceberg::table::Table>
 pub fn iceberg::table::Table::file_io(&self) -> &iceberg::io::FileIO
 pub fn iceberg::table::Table::identifier(&self) -> &iceberg::TableIdent
 pub fn iceberg::table::Table::inspect(&self) -> iceberg::inspect::MetadataTable<'_>
@@ -3273,6 +3293,7 @@ pub fn iceberg::table::Table::metadata_ref(&self) -> iceberg::spec::TableMetadat
 pub fn iceberg::table::Table::reader_builder(&self) -> iceberg::arrow::ArrowReaderBuilder
 pub fn iceberg::table::Table::readonly(&self) -> bool
 pub fn iceberg::table::Table::scan(&self) -> iceberg::scan::TableScanBuilder<'_>
+pub fn iceberg::table::Table::snapshot_loading_mode(&self) -> iceberg::table::SnapshotLoadingMode
 impl core::clone::Clone for iceberg::table::Table
 pub fn iceberg::table::Table::clone(&self) -> iceberg::table::Table
 impl core::fmt::Debug for iceberg::table::Table
@@ -3289,6 +3310,10 @@ pub fn iceberg::table::TableBuilder::metadata<T: core::convert::Into<iceberg::sp
 pub fn iceberg::table::TableBuilder::metadata_location<T: core::convert::Into<alloc::string::String>>(self, metadata_location: T) -> Self
 pub fn iceberg::table::TableBuilder::readonly(self, readonly: bool) -> Self
 pub fn iceberg::table::TableBuilder::runtime(self, runtime: iceberg::Runtime) -> Self
+pub fn iceberg::table::TableBuilder::snapshot_loader(self, snapshot_loader: alloc::sync::Arc<dyn iceberg::table::SnapshotLoader>) -> Self
+pub fn iceberg::table::TableBuilder::snapshot_loading_mode(self, snapshot_loading_mode: iceberg::table::SnapshotLoadingMode) -> Self
+pub trait iceberg::table::SnapshotLoader: core::fmt::Debug + core::marker::Send + core::marker::Sync
+pub fn iceberg::table::SnapshotLoader::load_all_snapshots<'life0, 'async_trait>(&'life0 self) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = iceberg::Result<alloc::vec::Vec<iceberg::spec::SnapshotRef>>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
 pub mod iceberg::transaction
 pub struct iceberg::transaction::ActionCommit
 impl iceberg::transaction::ActionCommit

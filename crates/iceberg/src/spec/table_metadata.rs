@@ -309,6 +309,44 @@ impl TableMetadata {
         self.snapshots.get(&snapshot_id)
     }
 
+    /// Replaces this metadata's snapshots with a reloaded, complete set, mirroring Java
+    /// `TableMetadata.ensureSnapshotsLoaded`.
+    ///
+    /// Snapshots newer than [`Self::last_sequence_number`] are dropped: the reload is a second
+    /// request, so it may observe commits that happened after this metadata was built, and this
+    /// instance must stay pinned to the state it was loaded at. Every ref (and the current
+    /// snapshot) must resolve against the result, which is what makes a reload that lost a
+    /// referenced snapshot an error instead of silent corruption.
+    pub(crate) fn with_reloaded_snapshots(
+        mut self,
+        snapshots: impl IntoIterator<Item = SnapshotRef>,
+    ) -> Result<Self> {
+        self.snapshots = snapshots
+            .into_iter()
+            .filter(|snapshot| snapshot.sequence_number() <= self.last_sequence_number)
+            .map(|snapshot| (snapshot.snapshot_id(), snapshot))
+            .collect();
+
+        if let Some(current_snapshot_id) = self.current_snapshot_id
+            && !self.snapshots.contains_key(&current_snapshot_id)
+        {
+            return Err(invalid_data!(
+                "Reloaded snapshots are missing the current snapshot {current_snapshot_id}"
+            ));
+        }
+
+        for (ref_name, snapshot_ref) in &self.refs {
+            if !self.snapshots.contains_key(&snapshot_ref.snapshot_id) {
+                return Err(invalid_data!(
+                    "Reloaded snapshots are missing snapshot {} referenced by '{ref_name}'",
+                    snapshot_ref.snapshot_id
+                ));
+            }
+        }
+
+        Ok(self)
+    }
+
     /// Returns snapshot history.
     #[inline]
     pub fn history(&self) -> &[SnapshotLog] {
