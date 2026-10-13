@@ -81,6 +81,8 @@ impl<'a> SnapshotsTable<'a> {
     /// Scans the snapshots table.
     pub async fn scan(&self) -> Result<ArrowRecordBatchStream> {
         let schema = schema_to_arrow_schema(&self.schema())?;
+        // This table enumerates every snapshot, so refs-loaded metadata would under-report.
+        let table = self.table.ensure_all_snapshots().await?;
 
         let mut committed_at =
             PrimitiveBuilder::<TimestampMicrosecondType>::new().with_timezone("+00:00");
@@ -108,7 +110,7 @@ impl<'a> SnapshotsTable<'a> {
                 (PARQUET_FIELD_ID_META_KEY.to_string(), "8".to_string()),
             ])),
         ));
-        for snapshot in self.table.metadata().snapshots() {
+        for snapshot in table.metadata().snapshots() {
             committed_at.append_value(snapshot.timestamp_ms() * 1000);
             snapshot_id.append_value(snapshot.snapshot_id());
             parent_id.append_option(snapshot.parent_snapshot_id());

@@ -1,5 +1,6 @@
 pub mod iceberg_catalog_rest
 pub use iceberg_catalog_rest::Credentials
+pub use iceberg_catalog_rest::SnapshotLoadingMode
 pub enum iceberg_catalog_rest::HttpRequestBody<'a>
 pub iceberg_catalog_rest::HttpRequestBody::Buffered(&'a [u8])
 pub iceberg_catalog_rest::HttpRequestBody::Empty
@@ -27,23 +28,6 @@ impl core::fmt::Debug for iceberg_catalog_rest::PayloadHashMode
 pub fn iceberg_catalog_rest::PayloadHashMode::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for iceberg_catalog_rest::PayloadHashMode
 impl core::marker::StructuralPartialEq for iceberg_catalog_rest::PayloadHashMode
-pub enum iceberg_catalog_rest::SnapshotLoadingMode
-pub iceberg_catalog_rest::SnapshotLoadingMode::All
-pub iceberg_catalog_rest::SnapshotLoadingMode::Refs
-impl iceberg_catalog_rest::SnapshotLoadingMode
-pub fn iceberg_catalog_rest::SnapshotLoadingMode::as_str(&self) -> &'static str
-impl core::clone::Clone for iceberg_catalog_rest::SnapshotLoadingMode
-pub fn iceberg_catalog_rest::SnapshotLoadingMode::clone(&self) -> iceberg_catalog_rest::SnapshotLoadingMode
-impl core::cmp::Eq for iceberg_catalog_rest::SnapshotLoadingMode
-impl core::cmp::PartialEq for iceberg_catalog_rest::SnapshotLoadingMode
-pub fn iceberg_catalog_rest::SnapshotLoadingMode::eq(&self, other: &iceberg_catalog_rest::SnapshotLoadingMode) -> bool
-impl core::fmt::Debug for iceberg_catalog_rest::SnapshotLoadingMode
-pub fn iceberg_catalog_rest::SnapshotLoadingMode::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::marker::Copy for iceberg_catalog_rest::SnapshotLoadingMode
-impl core::marker::StructuralPartialEq for iceberg_catalog_rest::SnapshotLoadingMode
-impl core::str::traits::FromStr for iceberg_catalog_rest::SnapshotLoadingMode
-pub type iceberg_catalog_rest::SnapshotLoadingMode::Err = iceberg::error::Error
-pub fn iceberg_catalog_rest::SnapshotLoadingMode::from_str(mode: &str) -> iceberg::error::Result<Self>
 pub struct iceberg_catalog_rest::CommitTableRequest
 pub iceberg_catalog_rest::CommitTableRequest::identifier: core::option::Option<iceberg::catalog::TableIdent>
 pub iceberg_catalog_rest::CommitTableRequest::requirements: alloc::vec::Vec<iceberg::catalog::TableRequirement>

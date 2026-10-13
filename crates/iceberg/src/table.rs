@@ -17,7 +17,11 @@
 
 //! Table API for Apache Iceberg
 
+use std::fmt::Debug;
+use std::str::FromStr;
 use std::sync::Arc;
+
+use async_trait::async_trait;
 
 use crate::arrow::ArrowReaderBuilder;
 use crate::encryption::EncryptionManager;
@@ -31,7 +35,68 @@ use crate::scan::TableScanBuilder;
 use crate::spec::{
     ManifestListReader, ManifestReader, SchemaRef, SnapshotRef, TableMetadata, TableMetadataRef,
 };
-use crate::{Result, TableIdent};
+use crate::{Error, Result, TableIdent};
+
+/// Which snapshots a catalog loaded into a table's metadata.
+///
+/// A catalog that supports loading only the referenced snapshots reports
+/// [`Refs`](Self::Refs) on the resulting [`Table`], so operations that need the
+/// full snapshot history can detect the incomplete metadata instead of
+/// silently misreading it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SnapshotLoadingMode {
+    /// The metadata holds every snapshot of the table.
+    #[default]
+    All,
+    /// The metadata holds only the snapshots referenced by a branch or tag, so
+    /// the catalog could skip the rest of the snapshot history.
+    ///
+    /// Unreferenced snapshots are absent, which also breaks the `parent_snapshot_id`
+    /// chain at any ancestor that is not itself a ref head.
+    ///
+    /// Operations that need the full history recover it through
+    /// [`Table::ensure_all_snapshots`], which is backed by a [`SnapshotLoader`]
+    /// the catalog installs alongside this mode.
+    Refs,
+}
+
+impl SnapshotLoadingMode {
+    /// The value identifying this mode in catalog configuration.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SnapshotLoadingMode::All => "all",
+            SnapshotLoadingMode::Refs => "refs",
+        }
+    }
+}
+
+impl FromStr for SnapshotLoadingMode {
+    type Err = Error;
+
+    fn from_str(mode: &str) -> Result<Self> {
+        match mode.to_ascii_lowercase().as_str() {
+            "all" => Ok(SnapshotLoadingMode::All),
+            "refs" => Ok(SnapshotLoadingMode::Refs),
+            other => Err(invalid_data!(
+                "unknown 'snapshot-loading-mode': {other}; expected `all` or `refs`"
+            )),
+        }
+    }
+}
+
+/// Re-reads a table's complete snapshot history.
+///
+/// A catalog that loaded only the referenced snapshots (see
+/// [`SnapshotLoadingMode::Refs`]) installs one of these so
+/// [`Table::ensure_all_snapshots`] can recover the snapshots it skipped. This is
+/// the async counterpart of Java's `TableMetadata` snapshots supplier: the reload
+/// is a second catalog request, so it cannot hide behind a synchronous getter the
+/// way it does in Java.
+#[async_trait]
+pub trait SnapshotLoader: Debug + Send + Sync {
+    /// Loads every snapshot of the table, including those no ref points at.
+    async fn load_all_snapshots(&self) -> Result<Vec<SnapshotRef>>;
+}
 
 /// Builder to create table scan.
 pub struct TableBuilder {
@@ -44,6 +109,8 @@ pub struct TableBuilder {
     disable_cache: bool,
     cache_size_bytes: Option<u64>,
     runtime: Option<Runtime>,
+    snapshot_loading_mode: SnapshotLoadingMode,
+    snapshot_loader: Option<Arc<dyn SnapshotLoader>>,
 }
 
 impl TableBuilder {
@@ -58,6 +125,8 @@ impl TableBuilder {
             disable_cache: false,
             cache_size_bytes: None,
             runtime: None,
+            snapshot_loading_mode: SnapshotLoadingMode::default(),
+            snapshot_loader: None,
         }
     }
 
@@ -88,6 +157,21 @@ impl TableBuilder {
     /// specifies if the Table is readonly or not (default not)
     pub fn readonly(mut self, readonly: bool) -> Self {
         self.readonly = readonly;
+        self
+    }
+
+    /// optional - records which snapshots the catalog loaded into the metadata
+    /// (defaults to [`SnapshotLoadingMode::All`]).
+    pub fn snapshot_loading_mode(mut self, snapshot_loading_mode: SnapshotLoadingMode) -> Self {
+        self.snapshot_loading_mode = snapshot_loading_mode;
+        self
+    }
+
+    /// optional - supplies the full snapshot history on demand. Required when
+    /// [`Self::snapshot_loading_mode`] is [`SnapshotLoadingMode::Refs`], since
+    /// otherwise the skipped snapshots are unrecoverable.
+    pub fn snapshot_loader(mut self, snapshot_loader: Arc<dyn SnapshotLoader>) -> Self {
+        self.snapshot_loader = Some(snapshot_loader);
         self
     }
 
@@ -133,6 +217,8 @@ impl TableBuilder {
             disable_cache,
             cache_size_bytes,
             runtime,
+            snapshot_loading_mode,
+            snapshot_loader,
         } = self;
 
         let Some(file_io) = file_io else {
@@ -189,6 +275,8 @@ impl TableBuilder {
             object_cache,
             runtime,
             encryption_manager,
+            snapshot_loading_mode,
+            snapshot_loader,
         })
     }
 }
@@ -204,12 +292,30 @@ pub struct Table {
     object_cache: Arc<ObjectCache>,
     runtime: Runtime,
     encryption_manager: Option<Arc<EncryptionManager>>,
+    snapshot_loading_mode: SnapshotLoadingMode,
+    snapshot_loader: Option<Arc<dyn SnapshotLoader>>,
 }
 
 impl Table {
     /// Sets the [`Table`] metadata and returns an updated instance with the new metadata applied.
     pub(crate) fn with_metadata(mut self, metadata: TableMetadataRef) -> Self {
         self.metadata = metadata;
+        self
+    }
+
+    /// Sets the [`Table`] snapshot loader and returns an updated instance.
+    #[cfg(test)]
+    pub(crate) fn with_snapshot_loader(mut self, loader: Arc<dyn SnapshotLoader>) -> Self {
+        self.snapshot_loader = Some(loader);
+        self
+    }
+
+    /// Sets the [`Table`] snapshot loading mode and returns an updated instance.
+    pub(crate) fn with_snapshot_loading_mode(
+        mut self,
+        snapshot_loading_mode: SnapshotLoadingMode,
+    ) -> Self {
+        self.snapshot_loading_mode = snapshot_loading_mode;
         self
     }
 
@@ -290,6 +396,52 @@ impl Table {
     /// Returns the flag indicating whether the `Table` is readonly or not
     pub fn readonly(&self) -> bool {
         self.readonly
+    }
+
+    /// Returns which snapshots the catalog loaded into this table's metadata.
+    ///
+    /// [`SnapshotLoadingMode::Refs`] means the metadata is missing every
+    /// unreferenced snapshot, so the snapshot history cannot be walked until
+    /// [`Self::ensure_all_snapshots`] has filled it in.
+    pub fn snapshot_loading_mode(&self) -> SnapshotLoadingMode {
+        self.snapshot_loading_mode
+    }
+
+    /// Returns this table with its complete snapshot history, re-reading it from
+    /// the catalog if the metadata was loaded with [`SnapshotLoadingMode::Refs`].
+    ///
+    /// Callers that walk ancestry or enumerate snapshots must go through this,
+    /// because refs-loaded metadata breaks the `parent_snapshot_id` chain at any
+    /// ancestor that is not a ref head, which silently truncates a walk rather
+    /// than failing it. This is a no-op (and makes no request) for metadata that
+    /// already holds every snapshot.
+    ///
+    /// The reload is pinned to this metadata's `last_sequence_number`, so commits
+    /// that landed after the original load are discarded rather than mixed in.
+    pub async fn ensure_all_snapshots(&self) -> Result<Table> {
+        if self.snapshot_loading_mode == SnapshotLoadingMode::All {
+            return Ok(self.clone());
+        }
+
+        let Some(loader) = &self.snapshot_loader else {
+            return Err(invalid_data!(
+                "Table '{}' was loaded with snapshot-loading-mode `refs` but has no \
+                 SnapshotLoader, so its snapshot history cannot be recovered",
+                self.identifier
+            ));
+        };
+
+        let snapshots = loader.load_all_snapshots().await?;
+        let metadata = self
+            .metadata
+            .as_ref()
+            .clone()
+            .with_reloaded_snapshots(snapshots)?;
+
+        Ok(self
+            .clone()
+            .with_metadata(Arc::new(metadata))
+            .with_snapshot_loading_mode(SnapshotLoadingMode::All))
     }
 
     /// Returns the current schema as a shared reference.

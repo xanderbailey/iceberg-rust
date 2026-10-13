@@ -298,6 +298,12 @@ struct ExpirePlan {
 #[async_trait]
 impl TransactionAction for ExpireSnapshotsAction {
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
+        // Expiry walks each branch's ancestry, which refs-loaded metadata truncates at the first
+        // unreferenced ancestor. Recover the full history before planning, or `retain_last` would
+        // silently under-retain and expire snapshots it promised to keep.
+        let full_table = table.ensure_all_snapshots().await?;
+        let table = &full_table;
+
         let metadata = table.metadata();
         let properties = metadata.table_properties();
 
@@ -365,18 +371,19 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use async_trait::async_trait;
     use chrono::Utc;
 
     use crate::spec::{
-        MAIN_BRANCH, Operation, PartitionStatisticsFile, Snapshot, SnapshotReference,
+        MAIN_BRANCH, Operation, PartitionStatisticsFile, Snapshot, SnapshotRef, SnapshotReference,
         SnapshotRetention, StatisticsFile, Summary,
     };
-    use crate::table::Table;
+    use crate::table::{SnapshotLoader, SnapshotLoadingMode, Table};
     use crate::transaction::Transaction;
     use crate::transaction::action::{ApplyTransactionAction, TransactionAction};
     use crate::transaction::expire_snapshots::ExpireSnapshotsAction;
     use crate::transaction::tests::{make_v2_minimal_table, make_v2_table};
-    use crate::{TableRequirement, TableUpdate};
+    use crate::{Result, TableRequirement, TableUpdate};
 
     // `make_v2_table` carries an older snapshot (ts 1515100955770) and a current
     // snapshot (ts 1555100955770).
@@ -406,6 +413,16 @@ mod tests {
             .into_iter()
             .find_map(|update| match update {
                 TableUpdate::RemoveSnapshots { snapshot_ids } => Some(snapshot_ids),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    fn removed_snapshot_ids(updates: &[TableUpdate]) -> Vec<i64> {
+        updates
+            .iter()
+            .find_map(|update| match update {
+                TableUpdate::RemoveSnapshots { snapshot_ids } => Some(snapshot_ids.clone()),
                 _ => None,
             })
             .unwrap_or_default()
@@ -677,6 +694,127 @@ mod tests {
         )
         .await;
         assert_eq!(removed, vec![1]);
+    }
+
+    /// `1 -> 2 -> 3` as the server knows it, but a `snapshots=refs` response carries only the ref
+    /// heads `1` and `3`, so `3`'s parent pointer dangles. Mirrors the REST refs response shape.
+    fn table_with_omitted_ancestor() -> Table {
+        table_with(
+            vec![
+                snapshot(1, None, 35, TS + 1),
+                snapshot(3, Some(2), 37, TS + 3),
+            ],
+            vec![(MAIN_BRANCH, branch(3, None)), ("old-tag", tag(1, Some(1)))],
+        )
+    }
+
+    /// The history a `snapshots=all` reload would return for [`table_with_omitted_ancestor`].
+    fn full_history() -> Vec<SnapshotRef> {
+        vec![
+            Arc::new(snapshot(1, None, 35, TS + 1)),
+            Arc::new(snapshot(2, Some(1), 36, TS + 2)),
+            Arc::new(snapshot(3, Some(2), 37, TS + 3)),
+        ]
+    }
+
+    fn refs_loaded(snapshots: Vec<SnapshotRef>) -> Table {
+        table_with_omitted_ancestor()
+            .with_snapshot_loading_mode(SnapshotLoadingMode::Refs)
+            .with_snapshot_loader(Arc::new(FakeSnapshotLoader(snapshots)))
+    }
+
+    #[derive(Debug)]
+    struct FakeSnapshotLoader(Vec<SnapshotRef>);
+
+    #[async_trait]
+    impl SnapshotLoader for FakeSnapshotLoader {
+        async fn load_all_snapshots(&self) -> Result<Vec<SnapshotRef>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// The fix: reloading restores the `1 -> 2 -> 3` chain, so `retain_last(3)` keeps all three
+    /// instead of truncating at the missing `2` and expiring `1`.
+    #[tokio::test]
+    async fn test_refs_loading_mode_reloads_history_before_expiring() {
+        let table = refs_loaded(full_history());
+
+        let updates = updates_of(
+            &table,
+            action().retain_last(3).expire_older_than_ms(i64::MAX),
+        )
+        .await;
+
+        assert_eq!(removed_refs(&updates), vec!["old-tag".to_string()]);
+        assert!(removed_snapshot_ids(&updates).is_empty());
+    }
+
+    /// A reload is a second request, so it can observe a commit that landed afterwards. Snapshots
+    /// past this metadata's `last_sequence_number` are dropped; otherwise snapshot `4` would look
+    /// unreferenced here and be expired out from under the concurrent writer.
+    #[tokio::test]
+    async fn test_reload_ignores_snapshots_from_a_concurrent_commit() {
+        let mut history = full_history();
+        history.push(Arc::new(snapshot(4, Some(3), 38, TS + 4)));
+        let table = refs_loaded(history);
+
+        let updates = updates_of(
+            &table,
+            action().retain_last(3).expire_older_than_ms(i64::MAX),
+        )
+        .await;
+
+        assert!(removed_snapshot_ids(&updates).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_reload_that_loses_a_referenced_snapshot_errors() {
+        // `main` points at 3, so a reload without it cannot be trusted.
+        let table = refs_loaded(vec![Arc::new(snapshot(1, None, 35, TS + 1))]);
+
+        let err = Arc::new(action().retain_last(3).expire_older_than_ms(i64::MAX))
+            .commit(&table)
+            .await
+            .err()
+            .unwrap();
+
+        assert!(
+            err.message().contains("missing the current snapshot"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_refs_loading_mode_without_a_loader_errors() {
+        let table =
+            table_with_omitted_ancestor().with_snapshot_loading_mode(SnapshotLoadingMode::Refs);
+
+        let err = Arc::new(action().retain_last(3).expire_older_than_ms(i64::MAX))
+            .commit(&table)
+            .await
+            .err()
+            .unwrap();
+
+        assert!(
+            err.message().contains("no SnapshotLoader"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Why the mode must be recorded accurately: with it left at `All`, nothing reloads, the walk
+    /// stops at the missing `2`, and `1` is expired despite `retain_last(3)`.
+    #[tokio::test]
+    async fn test_omitted_ancestor_truncates_retention_when_mode_is_wrong() {
+        let table = table_with_omitted_ancestor();
+
+        let updates = updates_of(
+            &table,
+            action().retain_last(3).expire_older_than_ms(i64::MAX),
+        )
+        .await;
+
+        assert_eq!(removed_refs(&updates), vec!["old-tag".to_string()]);
+        assert_eq!(removed_snapshot_ids(&updates), vec![1]);
     }
 
     #[tokio::test]
